@@ -1,12 +1,14 @@
 diff --git a/benchmarks/testbed_app/index.html b/benchmarks/testbed_app/index.html
 --- a/benchmarks/testbed_app/index.html
 +++ b/benchmarks/testbed_app/index.html
-@@ -165,10 +165,7 @@
+@@ -153,11 +153,7 @@
      function changeQuantity(id, delta) {
        const item = cart.find(i => i.id === id);
        if (!item) return;
 
 -      item.qty += delta;
+-
+-      // Notice: In the clean baseline, qty <= 0 removes item:
 -      if (item.qty <= 0) {
 -        cart = cart.filter(i => i.id !== id);
 -      }
@@ -14,4 +16,3 @@ diff --git a/benchmarks/testbed_app/index.html b/benchmarks/testbed_app/index.ht
 +      item.qty += delta;
        renderCart();
      }
-

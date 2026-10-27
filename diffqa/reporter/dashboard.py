@@ -1,6 +1,5 @@
 """Interactive single-file HTML Dashboard Generator for DiffQA QA audits."""
 
-import json
 from pathlib import Path
 from typing import List, Optional
 from diffqa.analyzer.flow_planner import TestFlowPlan
@@ -114,7 +113,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
           <tr>
             <td>
               <span class="badge {{ 'badge-pass' if item.passed else 'badge-fail' }}">
-                {{ 'PASS' if item.passed else 'FAIL' }}
+                {{ 'PASS' if item.passed else ('NOT TESTED' if item.verdict.verdict == 'ERROR' else 'FAIL') }}
               </span>
             </td>
             <td><b>{{ item.title }}</b></td>
@@ -200,10 +199,11 @@ class DashboardGenerator:
 
         passed_count = sum(1 for i in items if i.passed)
         failed_count = sum(1 for i in items if not i.passed)
-        specs_count = sum(1 for i in items if i.spec_code_ts or i.spec_code_py)
+        specs_count = sum(1 for i in items if i.spec_code_ts)
         quality_score = audit.quality_score if audit else (100 if failed_count == 0 else max(20, 100 - failed_count * 25))
 
-        tmpl = Template(DASHBOARD_TEMPLATE)
+        # Audit messages and verdicts carry text from the tested site and the model: escape it.
+        tmpl = Template(DASHBOARD_TEMPLATE, autoescape=True)
         return tmpl.render(
             preview_url=preview_url,
             plan=plan,

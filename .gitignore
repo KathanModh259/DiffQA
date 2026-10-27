@@ -46,6 +46,7 @@ yarn-error.log*
 runs/
 screenshots/
 diffqa_output/
+.diffqa_auth.json
 
 # IDE / OS
 .vscode/

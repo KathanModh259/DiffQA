@@ -51,12 +51,18 @@ dev = [
 ]
 
 [project.scripts]
-diffqa = "diffqa.cli:app"
+diffqa = "diffqa.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/KathanModh259/DiffQA"
 Repository = "https://github.com/KathanModh259/DiffQA"
 Issues = "https://github.com/KathanModh259/DiffQA/issues"
+
+[tool.setuptools.packages.find]
+include = ["diffqa*", "benchmarks*"]
+
+[tool.setuptools.package-data]
+benchmarks = ["testbed_app/*.html", "scenarios/*.diff"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

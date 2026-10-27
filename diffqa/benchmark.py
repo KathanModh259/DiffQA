@@ -1,149 +1,155 @@
-"""Benchmark evaluation harness measuring bug detection recall, precision, and test synthesis."""
+"""Benchmark harness: apply each seeded bug diff to the testbed, serve it, and run the real pipeline.
 
-import asyncio
-import os
-import sys
+A clean (unpatched) baseline run is included so false positives show up in the scorecard.
+"""
+
+import re
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+
 from rich.console import Console
 from rich.table import Table
 
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-from diffqa.analyzer.diff_parser import DiffParser
+from benchmarks.serve import DIRECTORY as TESTBED_DIR, serve_in_background
+from diffqa.agent.browser import BrowserController
+from diffqa.analyzer.diff_parser import DiffParser, ParsedDiff
 from diffqa.analyzer.flow_planner import FlowPlanner
 from diffqa.config import Settings
-from diffqa.judge.oracle import BugSeverity, JudgeVerdict
 from diffqa.llm.client import LLMClient
-from diffqa.synthesizer.test_writer import PlaywrightTestSynthesizer
+from diffqa.pipeline import execute_plan
+from diffqa.reporter.markdown import FlowReportItem
 
 console = Console()
+
+BASELINE = "baseline_clean"
 
 
 @dataclass
 class ScenarioResult:
     scenario_name: str
-    diff_file: str
     expected_bug: bool
     detected_bug: bool
-    bug_type: Optional[str]
+    bug_title: Optional[str]
     severity: Optional[str]
     synthesized_spec: bool
     latency_seconds: float
 
 
-class BenchmarkRunner:
-    """Executes DiffQA across a suite of seeded regression PR diffs."""
+def apply_testbed_diff(diff_text: str, html: str) -> str:
+    """Apply a seeded diff to the testbed HTML by exact text match.
 
-    def __init__(self, scenarios_dir: Path | str, testbed_url: str = "http://localhost:3000", provider: str = "mock"):
+    Matching on hunk content instead of line numbers keeps hand-written scenario diffs
+    valid even when their @@ headers drift from the file.
+    """
+    html = html.replace("\r\n", "\n")
+    for hunk in re.split(r"^@@[^\n]*@@[^\n]*\n", diff_text.replace("\r\n", "\n"), flags=re.MULTILINE)[1:]:
+        old: List[str] = []
+        new: List[str] = []
+        for line in hunk.rstrip("\n").split("\n"):
+            if line.startswith("diff --git"):
+                break
+            tag, body = (line[:1], line[1:]) if line else (" ", "")
+            if tag in " -":
+                old.append(body)
+            if tag in " +":
+                new.append(body)
+        old_block, new_block = "\n".join(old), "\n".join(new)
+        if old_block not in html:
+            raise ValueError(f"Hunk does not match testbed source:\n{old_block[:200]}")
+        html = html.replace(old_block, new_block, 1)
+    return html
+
+
+def build_testbed(diff_path: Optional[Path], dest: Path) -> None:
+    html = (TESTBED_DIR / "index.html").read_text(encoding="utf-8")
+    if diff_path:
+        html = apply_testbed_diff(diff_path.read_text(encoding="utf-8"), html)
+    (dest / "index.html").write_text(html, encoding="utf-8")
+
+
+class BenchmarkRunner:
+    """Runs DiffQA end-to-end against a patched testbed for every seeded regression diff."""
+
+    def __init__(self, scenarios_dir: Path | str, provider: str = "mock", headless: bool = True):
         self.scenarios_dir = Path(scenarios_dir)
-        self.testbed_url = testbed_url
-        self.provider = provider
-        self.settings = Settings(provider=provider)  # type: ignore
+        self.settings = Settings(provider=provider, headless=headless)  # type: ignore[arg-type]
         self.llm = LLMClient(settings=self.settings)
 
     async def run_benchmark(self) -> List[ScenarioResult]:
-        diff_files = sorted(list(self.scenarios_dir.glob("*.diff")))
+        diff_files = sorted(self.scenarios_dir.glob("*.diff"))
         if not diff_files:
             raise FileNotFoundError(f"No .diff files found in {self.scenarios_dir}")
 
-        parser = DiffParser()
-        planner = FlowPlanner(llm_client=self.llm)
-        synthesizer = PlaywrightTestSynthesizer()
-
-        results: List[ScenarioResult] = []
-
+        results = [await self._run_scenario(BASELINE, None)]
         for diff_path in diff_files:
-            start_t = time.time()
-            scenario_name = diff_path.stem
-
-            parsed = parser.parse_file(diff_path)
-            plan = await planner.plan_flows(parsed, preview_url=self.testbed_url)
-
-            # In benchmark mode, simulate detection or evaluate planned flow invariants
-            detected = False
-            bug_type = None
-            severity = None
-            spec_generated = False
-
-            # Check if any adversarial or regression flows were mapped
-            adversarial_flows = [f for f in plan.flows if f.flow_type in ("adversarial", "visual_regression")]
-            if adversarial_flows or "negative" in scenario_name or "uncaught" in scenario_name or "css" in scenario_name:
-                detected = True
-                bug_type = "functional_regression" if "negative" in scenario_name else ("runtime_crash" if "uncaught" in scenario_name else "visual_regression")
-                severity = "CRITICAL" if "negative" in scenario_name or "uncaught" in scenario_name else "HIGH"
-
-                # Synthesize spec
-                verdict = JudgeVerdict(
-                    flow_id=f"benchmark_{scenario_name}",
-                    passed=False,
-                    verdict="FAIL",
-                    title=f"Regression caught in scenario {scenario_name}",
-                    root_cause_hypothesis=f"Seeded code defect in {scenario_name}.diff",
-                    repro_steps=["1. Navigate to /", "2. Interact with modified component", "3. Invariant failed"],
-                )
-                spec = synthesizer.synthesize_typescript(
-                    verdict=verdict,
-                    steps=[],
-                    initial_url=self.testbed_url,
-                    flow_title=scenario_name,
-                )
-                spec_generated = len(spec) > 50
-
-            latency = time.time() - start_t
-            results.append(ScenarioResult(
-                scenario_name=scenario_name,
-                diff_file=diff_path.name,
-                expected_bug=True,
-                detected_bug=detected,
-                bug_type=bug_type,
-                severity=severity,
-                synthesized_spec=spec_generated,
-                latency_seconds=latency,
-            ))
-
+            results.append(await self._run_scenario(diff_path.stem, diff_path))
         return results
 
-    def print_scorecard(self, results: List[ScenarioResult]) -> None:
-        total = len(results)
-        detected = sum(1 for r in results if r.detected_bug)
-        specs = sum(1 for r in results if r.synthesized_spec)
-        recall = (detected / total * 100) if total > 0 else 0
-        avg_time = sum(r.latency_seconds for r in results) / total if total > 0 else 0
+    async def _run_scenario(self, name: str, diff_path: Optional[Path]) -> ScenarioResult:
+        console.rule(f"[bold cyan]{name}")
+        start = time.time()
+        parsed = DiffParser().parse_file(diff_path) if diff_path else ParsedDiff()
 
-        table = Table(title="🏆 DiffQA Seeded Regression Benchmark Scorecard")
+        with tempfile.TemporaryDirectory() as tmp:
+            site_dir, out_dir = Path(tmp) / "site", Path(tmp) / "out"
+            site_dir.mkdir()
+            build_testbed(diff_path, site_dir)
+            server, url = serve_in_background(site_dir)
+            controller = BrowserController(settings=self.settings)
+            try:
+                plan = await FlowPlanner(llm_client=self.llm).plan_flows(parsed, preview_url=url)
+                await controller.start()
+                items = await execute_plan(plan, url, controller, self.llm, self.settings, out_dir)
+            finally:
+                await controller.close()
+                server.shutdown()
+                server.server_close()
+
+        failed: List[FlowReportItem] = [i for i in items if not i.passed]
+        first = failed[0].verdict if failed else None
+        return ScenarioResult(
+            scenario_name=name,
+            expected_bug=diff_path is not None,
+            detected_bug=bool(failed),
+            bug_title=first.title if first else None,
+            severity=first.severity.value if first and first.severity else None,
+            synthesized_spec=any(i.spec_code_ts for i in failed),
+            latency_seconds=time.time() - start,
+        )
+
+    def print_scorecard(self, results: List[ScenarioResult]) -> None:
+        table = Table(title="DiffQA Seeded Regression Benchmark")
         table.add_column("Scenario", style="cyan")
-        table.add_column("Diff File", style="dim")
-        table.add_column("Expected Bug", justify="center")
-        table.add_column("Detected Bug", justify="center")
+        table.add_column("Expected", justify="center")
+        table.add_column("Detected", justify="center")
+        table.add_column("Finding")
         table.add_column("Severity", style="magenta")
-        table.add_column("Spec Synthesized", justify="center")
+        table.add_column("Spec", justify="center")
         table.add_column("Time", justify="right")
 
         for r in results:
-            det_str = "[bold green]YES[/bold green]" if r.detected_bug else "[bold red]NO[/bold red]"
-            spec_str = "[bold green]✅ .spec.ts[/bold green]" if r.synthesized_spec else "[red]None[/red]"
+            correct = r.detected_bug == r.expected_bug
             table.add_row(
                 r.scenario_name,
-                r.diff_file,
-                "YES",
-                det_str,
+                "bug" if r.expected_bug else "clean",
+                f"[{'green' if correct else 'red'}]{'YES' if r.detected_bug else 'NO'}[/]",
+                (r.bug_title or "-")[:60],
                 r.severity or "-",
-                spec_str,
-                f"{r.latency_seconds:.2f}s",
+                "yes" if r.synthesized_spec else "-",
+                f"{r.latency_seconds:.1f}s",
             )
-
         console.print(table)
-        console.print(f"\n[bold]Summary Metrics:[/bold]")
-        console.print(f"• Total Seeded Bug Scenarios: [bold]{total}[/bold]")
-        console.print(f"• Regressions Caught (Recall): [bold green]{recall:.1f}%[/bold green]")
-        console.print(f"• Playwright Specs Generated: [bold]{specs}/{total} ({specs/total*100:.1f}%)[/bold]")
-        console.print(f"• Avg Detection Latency: [bold]{avg_time:.2f}s[/bold]\n")
 
+        seeded = [r for r in results if r.expected_bug]
+        clean = [r for r in results if not r.expected_bug]
+        caught = sum(r.detected_bug for r in seeded)
+        false_pos = sum(r.detected_bug for r in clean)
+        console.print(f"Recall: [bold]{caught}/{len(seeded)}[/bold] seeded regressions caught")
+        console.print(f"False positives: [bold]{false_pos}/{len(clean)}[/bold] clean runs flagged")
+        console.print(f"Provider: [magenta]{self.settings.provider}[/magenta]")
+        if self.settings.provider == "mock":
+            console.print("[dim]The mock provider only detects hard runtime/network errors; "
+                          "invariant bugs need a real model.[/dim]")

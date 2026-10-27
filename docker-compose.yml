@@ -8,7 +8,7 @@ services:
       - ./.diffqa_auth.json:/app/.diffqa_auth.json
     environment:
       - DIFFQA_PROVIDER=${DIFFQA_PROVIDER:-mock}
-      - META_API_KEY=${META_API_KEY:-}
+      - MODEL_API_KEY=${MODEL_API_KEY:-}
       - FIREWORKS_API_KEY=${FIREWORKS_API_KEY:-}
       - BASETEN_API_KEY=${BASETEN_API_KEY:-}
       - MODAL_API_KEY=${MODAL_API_KEY:-}

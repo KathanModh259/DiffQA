@@ -9,8 +9,11 @@ zero API cost.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -22,8 +25,33 @@ logger = logging.getLogger("diffqa.llm")
 # ── Provider endpoint constants ────────────────────────────────────────────
 _FIREWORKS_BASE = "https://api.fireworks.ai/inference/v1/chat/completions"
 _BASETEN_BASE = "https://bridge.baseten.co/v1/chat/completions"
-_OLLAMA_BASE = "http://localhost:11434/api/chat"
-_HTTP_TIMEOUT = 90.0  # generous timeout for large model responses
+_HTTP_TIMEOUT = 120.0  # reasoning models can take a while on large prompts
+_MAX_ATTEMPTS = 4
+_RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+async def _post_with_retry(url: str, payload: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
+    """POST JSON, retrying rate limits, 5xx and network errors with exponential backoff + jitter."""
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code not in _RETRYABLE_STATUS or attempt == _MAX_ATTEMPTS:
+                    if resp.is_error:
+                        # Surface the provider's message ("model not found", "invalid key"...) instead of a bare status.
+                        raise httpx.HTTPStatusError(
+                            f"{resp.status_code} from {url}: {resp.text[:500]}", request=resp.request, response=resp
+                        )
+                    return resp.json()
+                retry_after = resp.headers.get("retry-after", "")
+                delay = float(retry_after) if retry_after.isdigit() else 2 ** attempt
+            except (httpx.TransportError, httpx.TimeoutException) as e:
+                if attempt == _MAX_ATTEMPTS:
+                    raise
+                logger.warning("LLM request failed (%s), retrying.", e)
+                delay = 2 ** attempt
+            await asyncio.sleep(min(delay, 30) + random.random())
+    raise AssertionError("unreachable")
 
 
 class LLMClient:
@@ -46,44 +74,27 @@ class LLMClient:
         provider = self.settings.provider
         target_model = model or self.settings.code_model
 
-        dispatch = {
-            "mock": lambda: self._mock_completion(messages, target_model),
-            "meta": lambda: self._call_openai_compat(
-                messages, target_model, temperature, max_tokens, json_mode,
-                base_url=f"{self.settings.meta_api_base}/chat/completions",
-                api_key=self.settings.meta_api_key,
-                auth_prefix="Bearer",
-            ),
-            "fireworks": lambda: self._call_openai_compat(
-                messages, target_model, temperature, max_tokens, json_mode,
-                base_url=_FIREWORKS_BASE,
-                api_key=self.settings.fireworks_api_key,
-                auth_prefix="Bearer",
-            ),
-            "baseten": lambda: self._call_openai_compat(
-                messages, target_model, temperature, max_tokens, json_mode,
-                base_url=_BASETEN_BASE,
-                api_key=self.settings.baseten_api_key,
-                auth_prefix="Api-Key",
-            ),
-            "modal": lambda: self._call_openai_compat(
-                messages, target_model, temperature, max_tokens, json_mode,
-                base_url=f"{self.settings.meta_api_base}/chat/completions",
-                api_key=self.settings.modal_api_key,
-                auth_prefix="Bearer",
-            ),
-            "ollama": lambda: self._call_ollama(messages, target_model, temperature, max_tokens, json_mode),
-        }
+        if provider == "mock":
+            return self._mock_completion(messages)
+        if provider == "ollama":
+            return await self._call_ollama(messages, target_model, temperature, json_mode)
 
-        handler = dispatch.get(provider)
-        if handler is None:
-            logger.warning("Unknown provider '%s', falling back to mock.", provider)
-            return self._mock_completion(messages, target_model)
-        result = handler()
-        # handle both sync (mock) and async returns
-        if hasattr(result, "__await__"):
-            return await result
-        return result
+        s = self.settings
+        endpoints = {
+            "meta": (f"{s.meta_api_base}/chat/completions", s.meta_api_key, "Bearer"),
+            "fireworks": (_FIREWORKS_BASE, s.fireworks_api_key, "Bearer"),
+            "baseten": (_BASETEN_BASE, s.baseten_api_key, "Api-Key"),
+            "modal": (f"{s.modal_api_base}/chat/completions" if s.modal_api_base else None, s.modal_api_key, "Bearer"),
+        }
+        base_url, api_key, auth_prefix = endpoints[provider]
+        if not base_url:
+            raise ValueError(f"Provider '{provider}' needs an API base URL (set MODAL_API_BASE).")
+        if not api_key:
+            raise ValueError(f"Provider '{provider}' selected but its API key is not set.")
+        return await self._call_openai_compat(
+            messages, target_model, temperature, max_tokens, json_mode,
+            base_url=base_url, api_key=api_key, auth_prefix=auth_prefix,
+        )
 
     async def complete_json(
         self,
@@ -91,9 +102,20 @@ class LLMClient:
         model: Optional[str] = None,
         temperature: float = 0.1,
     ) -> Dict[str, Any]:
-        """Request a completion, parse and return the result as a JSON dict."""
+        """Request a completion, parse and return the result as a JSON dict.
+
+        One repair round-trip is made if the model answers with something that isn't JSON.
+        """
         raw = await self.complete(messages, model=model, temperature=temperature, json_mode=True)
-        return self._parse_json(raw)
+        try:
+            return self._parse_json(raw)
+        except ValueError:
+            logger.warning("Model returned non-JSON output; asking it to repair once.")
+        repair = messages + [
+            {"role": "assistant", "content": raw},
+            {"role": "user", "content": "That was not valid JSON. Reply with only the JSON object, no prose or code fences."},
+        ]
+        return self._parse_json(await self.complete(repair, model=model, temperature=temperature, json_mode=True))
 
     # ── Private provider methods ───────────────────────────────────────
 
@@ -106,14 +128,10 @@ class LLMClient:
         json_mode: bool,
         *,
         base_url: str,
-        api_key: Optional[str],
+        api_key: str,
         auth_prefix: str = "Bearer",
     ) -> str:
         """Generic caller for any OpenAI-compatible chat/completions endpoint."""
-        if not api_key:
-            logger.warning("API key missing for %s — falling back to mock.", base_url)
-            return self._mock_completion(messages, model)
-
         headers = {
             "Authorization": f"{auth_prefix} {api_key}",
             "Content-Type": "application/json",
@@ -127,18 +145,22 @@ class LLMClient:
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-            resp = await client.post(base_url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
+        try:
+            data = await _post_with_retry(base_url, payload, headers)
+        except httpx.HTTPStatusError as e:
+            # Not every OpenAI-compatible host accepts response_format; the prompt already demands JSON.
+            if e.response.status_code == 400 and "response_format" in payload:
+                payload.pop("response_format")
+                data = await _post_with_retry(base_url, payload, headers)
+            else:
+                raise
+        return data["choices"][0]["message"].get("content") or ""
 
     async def _call_ollama(
         self,
         messages: List[Dict[str, Any]],
         model: str,
         temperature: float,
-        max_tokens: int,
         json_mode: bool,
     ) -> str:
         """Call a local Ollama instance (e.g. llama3.3, llama3.2-vision)."""
@@ -150,10 +172,8 @@ class LLMClient:
         }
         if json_mode:
             payload["format"] = "json"
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-            resp = await client.post(_OLLAMA_BASE, json=payload)
-            resp.raise_for_status()
-            return resp.json()["message"]["content"]
+        data = await _post_with_retry(self.settings.ollama_api_base, payload, {})
+        return data["message"].get("content") or ""
 
     # ── JSON parsing helper ────────────────────────────────────────────
 
@@ -181,108 +201,69 @@ class LLMClient:
                 return json.loads(cleaned[start : end + 1])
             except json.JSONDecodeError:
                 pass
-        # Last resort: try extracting JSON array
-        start = cleaned.find("[")
-        end = cleaned.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(cleaned[start : end + 1])
-            except json.JSONDecodeError:
-                pass
         raise ValueError(f"Could not parse JSON from model output (first 300 chars): {raw_text[:300]}")
 
     # ── Mock provider ──────────────────────────────────────────────────
 
-    def _mock_completion(self, messages: List[Dict[str, Any]], model: str) -> str:
-        """Return context-aware mock responses for the full DiffQA pipeline.
+    @staticmethod
+    def _mock_completion(messages: List[Dict[str, Any]]) -> str:
+        """Deterministic offline stand-in for a real model.
 
-        The mock is designed to exercise every module (planner, agent, judge)
-        end-to-end so that ``diffqa demo`` and ``diffqa eval`` work
-        deterministically without any API keys.
+        It never invents bugs: the planner returns a generic smoke plan, the
+        agent clicks each visible enabled button once, and the judge fails a
+        flow only when the run produced hard evidence (errors, 5xx, failed
+        actions). Anything subtler needs a real model.
         """
-        prompt_text = " ".join(str(m.get("content", "")) for m in messages).lower()
+        prompt = "\n".join(str(m.get("content", "")) for m in messages)
+        lowered = prompt.lower()
 
-        # ── Flow Planner & Site Explorer mock ──────────────────────────
-        if any(kw in prompt_text for kw in ("flow planner", "test flows", "affected routes", "plan user flows", "map out", "site explorer", "exploratory user journeys")):
+        if "choose the next action" in lowered:
+            history_part, _, elements_part = prompt.partition("Available Interactive Elements on Page:")
+            clicked = set(re.findall(r"target=(\S+)", history_part))
+            for elem_id, tag, rest in re.findall(r"^\[([^\]]+)\] <(\w+)>(.*)$", elements_part, re.MULTILINE):
+                if elem_id not in clicked and tag == "button" and "(DISABLED)" not in rest:
+                    return json.dumps({
+                        "thought": f"Clicking unexplored button [{elem_id}].",
+                        "action": "click",
+                        "target_id": elem_id,
+                        "is_terminal": False,
+                    })
             return json.dumps({
-                "summary": "PR modifies cart state management — quantity updates, item removal, and subtotal calculation logic.",
-                "affected_routes": ["/", "/cart", "/checkout"],
-                "risk_assessment": "HIGH — removing the qty <= 0 guard allows negative quantities and corrupted subtotals.",
-                "flows": [
-                    {
-                        "flow_id": "flow-cart-quantity-update",
-                        "title": "Update item quantity in cart",
-                        "route": "/cart",
-                        "flow_type": "happy_path",
-                        "goal": "Verify updating item quantity recalculates subtotal correctly.",
-                        "steps": [
-                            "Navigate to '/' and add a product to cart",
-                            "Navigate to '/cart'",
-                            "Click increment quantity button",
-                            "Verify quantity is 2 and subtotal matches unit_price * 2",
-                        ],
-                        "invariants": [
-                            "Subtotal == unit_price * quantity for each item",
-                            "No NaN or negative values in pricing display",
-                            "No uncaught JavaScript exceptions in console",
-                        ],
-                    },
-                    {
-                        "flow_id": "flow-cart-negative-boundary",
-                        "title": "Decrement item quantity below zero",
-                        "route": "/cart",
-                        "flow_type": "adversarial",
-                        "goal": "Verify decrementing quantity at 1 removes item or clamps to zero — never goes negative.",
-                        "steps": [
-                            "Navigate to '/cart' with 1 item (qty=1)",
-                            "Click decrement button repeatedly",
-                            "Verify quantity never becomes 0 or negative without item removal",
-                        ],
-                        "invariants": [
-                            "Item quantity >= 0 at all times",
-                            "Cart total is always non-negative",
-                            "Checkout button disables when cart is empty",
-                        ],
-                    },
-                ],
+                "thought": "Every visible button has been exercised.",
+                "action": "wait",
+                "value": "300",
+                "is_terminal": True,
             })
 
-        # ── Browser Agent mock ─────────────────────────────────────────
-        if any(kw in prompt_text for kw in ("choose the next action", "available interactive elements", "select next browser action")):
-            if "btn-qty-decrement" in prompt_text:
-                return json.dumps({
-                    "thought": "Decrement button is visible. Clicking to test qty boundary behavior.",
-                    "action": "click",
-                    "target_id": "btn-qty-decrement",
-                    "value": None,
-                    "is_terminal": True,
-                })
-            return json.dumps({
-                "thought": "Adding a product to cart to set up the test scenario.",
-                "action": "click",
-                "target_id": "btn-add-to-cart-1",
-                "value": None,
-                "is_terminal": False,
-            })
-
-        # ── Regression Judge mock ──────────────────────────────────────
-        if any(kw in prompt_text for kw in ("regression judge", "judge regression", "evaluate whether", "regression")):
+        if "evaluate whether this constitutes a bug" in lowered:
+            evidence = prompt.partition("Detected Evidence:")[2].partition("\n\n")[0].strip()
+            if evidence in ("", "[]"):
+                return json.dumps({"verdict": "PASS", "confidence": 0.5})
             return json.dumps({
                 "verdict": "FAIL",
-                "bug_type": "functional_regression",
-                "title": "Cart quantity decrements to negative value; subtotal displays negative balance",
-                "root_cause_hypothesis": "The refactored changeQuantity() removed the `if (item.qty <= 0)` guard that previously filtered the item from the cart array.",
-                "severity": "CRITICAL",
-                "repro_steps": [
-                    "1. Add 'Meta Ray-Ban Smart Glasses' to cart",
-                    "2. Navigate to /cart",
-                    "3. Click the '-' (decrement) button twice",
-                    "4. Observe: quantity shows -1, subtotal shows -$299.00",
-                ],
-                "confidence": 0.96,
+                "title": "Errors observed during flow execution",
+                "root_cause_hypothesis": f"Mock judge: hard evidence was recorded: {evidence[:300]}",
+                "confidence": 0.7,
             })
 
-        # ── Fallback ───────────────────────────────────────────────────
+        if '"flows"' in prompt:
+            return json.dumps({
+                "summary": "Mock plan: generic smoke and click-through flows (no model analysis).",
+                "affected_routes": ["/"],
+                "risk_assessment": "UNKNOWN — mock provider does not analyse the change.",
+                "flows": [
+                    {
+                        "flow_id": "flow-smoke-click-through",
+                        "title": "Click through every visible control",
+                        "route": "/",
+                        "flow_type": "happy_path",
+                        "goal": "Every button can be clicked without runtime errors or server failures.",
+                        "steps": ["Load the page", "Click each visible enabled button once"],
+                        "invariants": ["No uncaught JavaScript exceptions", "No HTTP 5xx responses"],
+                    },
+                ],
+            })
+
         return json.dumps({"status": "ok", "message": "DiffQA mock — no specific handler matched."})
 
 

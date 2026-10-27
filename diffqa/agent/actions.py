@@ -2,7 +2,7 @@
 
 from enum import Enum
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ActionType(str, Enum):
@@ -15,13 +15,35 @@ class ActionType(str, Enum):
     ASSERT = "assert"
 
 
+# Synonyms models commonly use for the supported actions.
+_ACTION_ALIASES = {"type": "fill", "input": "fill", "enter_text": "fill", "goto": "navigate", "go_to": "navigate",
+                   "open": "navigate", "tap": "click", "keypress": "press", "key": "press", "sleep": "wait",
+                   "verify": "assert", "check": "assert", "done": "wait", "finish": "wait"}
+
+
 class AgentAction(BaseModel):
-    thought: str = Field(description="Reasoning behind choosing this action")
+    # Numbers for value ("300") and target ids (12) are common in model output.
+    model_config = ConfigDict(coerce_numbers_to_str=True)
+
+    thought: str = Field(default="", description="Reasoning behind choosing this action")
     action: ActionType
     target_id: Optional[str] = Field(default=None, description="DiffQA element ID (e.g. 'elem-12' or 'btn-checkout')")
     selector: Optional[str] = Field(default=None, description="CSS / XPath / Playwright selector")
     value: Optional[str] = Field(default=None, description="Text to fill, key to press, URL to navigate, or text to assert")
     is_terminal: bool = Field(default=False, description="True if the test flow goal is satisfied or aborted")
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _action(cls, v: object) -> str:
+        if isinstance(v, ActionType):
+            return v.value
+        v = str(v or "").strip().lower().replace(" ", "_")
+        return _ACTION_ALIASES.get(v, v)
+
+    @field_validator("thought", mode="before")
+    @classmethod
+    def _thought(cls, v: object) -> str:
+        return "" if v is None else str(v)
 
 
 class ExecutionStep(BaseModel):
@@ -35,4 +57,3 @@ class ExecutionStep(BaseModel):
     success: bool = True
     error_message: Optional[str] = None
     duration_ms: float = 0.0
-

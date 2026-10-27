@@ -42,13 +42,17 @@ class TestFlowPlanner:
         assert plan.risk_assessment != ""
 
     @pytest.mark.asyncio
-    async def test_generates_adversarial_flows(self, parser, mock_llm):
-        parsed = parser.parse_string(CART_DIFF)
-        planner = FlowPlanner(llm_client=mock_llm)
-        plan = await planner.plan_flows(parsed)
+    async def test_prompt_contains_diff_and_truncates(self, parser):
+        class RecordingLLM:
+            async def complete_json(self, messages, model=None):
+                self.prompt = messages[-1]["content"]
+                return {"summary": "s", "risk_assessment": "r", "flows": []}
 
-        adversarial = [f for f in plan.flows if f.flow_type == "adversarial"]
-        assert len(adversarial) >= 1
+        llm = RecordingLLM()
+        huge = CART_DIFF + "+" + "x" * (FlowPlanner.MAX_DIFF_CHARS * 2) + "\n"
+        await FlowPlanner(llm_client=llm).plan_flows(parser.parse_string(huge))
+        assert "src/Cart.tsx" in llm.prompt
+        assert "(truncated)" in llm.prompt
 
     @pytest.mark.asyncio
     async def test_flows_have_invariants(self, parser, mock_llm):

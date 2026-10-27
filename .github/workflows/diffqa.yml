@@ -1,5 +1,8 @@
 name: DiffQA Autonomous PR Regression Testing
 
+# Setup: add the secret MODEL_API_KEY (Meta Model API) and the repository variable
+# DIFFQA_PREVIEW_URL (your PR preview deployment). Without the variable this job is skipped.
+
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -10,54 +13,55 @@ permissions:
 
 jobs:
   diffqa-test:
+    if: ${{ vars.DIFFQA_PREVIEW_URL != '' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install DiffQA & Dependencies
+      - name: Install DiffQA
         run: |
-          pip install -e .
+          pip install .
           playwright install chromium --with-deps
 
-      - name: Generate PR Git Diff
-        run: |
-          git diff origin/${{ github.base_ref }}...HEAD > pr.diff
-          echo "Generated PR diff size: $(wc -l < pr.diff) lines"
+      - name: Generate PR diff
+        run: git diff origin/${{ github.base_ref }}...HEAD > pr.diff
 
-      - name: Run DiffQA Autonomous Agent
+      - name: Run DiffQA
         env:
-          META_API_KEY: ${{ secrets.META_API_KEY }}
-          DIFFQA_CODE_MODEL: meta/muse-code
-          DIFFQA_AGENT_MODEL: meta/muse-spark
-          DIFFQA_JUDGE_MODEL: meta/muse-wonder
-        run: |
-          # Use local server or preview deployment URL
-          diffqa run --diff pr.diff --url http://localhost:3000 --output ./diffqa_output
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+        # Exits 1 when a regression is found, failing this job.
+        run: diffqa run --diff pr.diff --url "${{ vars.DIFFQA_PREVIEW_URL }}" --provider meta --output ./diffqa_output
 
-      - name: Post DiffQA Report to PR Comment
+      - name: Upload screenshots, specs and dashboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffqa-output
+          path: diffqa_output/
+          if-no-files-found: ignore
+
+      - name: Post report as PR comment
         if: always()
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const path = './diffqa_output/DIFFQA_REPORT.md';
-            if (fs.existsSync(path)) {
-              const body = fs.readFileSync(path, 'utf8');
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: body
-              });
-            }
-
+            if (!fs.existsSync(path)) return;
+            let body = fs.readFileSync(path, 'utf8');
+            const limit = 65000;  // GitHub rejects comments over 65536 chars
+            if (body.length > limit) body = body.slice(0, limit) + '\n\n_Report truncated; see the diffqa-output artifact._';
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });

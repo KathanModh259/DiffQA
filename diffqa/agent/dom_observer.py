@@ -35,14 +35,15 @@ DOM_EXTRACTION_SCRIPT = """
     );
 
     const results = [];
-    let counter = 0;
+    // Counter lives on window so IDs stay unique across repeated scans of the same document.
+    window.__diffqaCounter = window.__diffqaCounter || 0;
 
     candidates.forEach((el) => {
         if (!isVisible(el)) return;
 
         let diffqaId = el.getAttribute('data-diffqa-id');
         if (!diffqaId) {
-            diffqaId = el.id || el.getAttribute('data-testid') || `elem-${counter++}`;
+            diffqaId = el.id || el.getAttribute('data-testid') || `elem-${window.__diffqaCounter++}`;
             el.setAttribute('data-diffqa-id', diffqaId);
         }
 
@@ -56,11 +57,11 @@ DOM_EXTRACTION_SCRIPT = """
         const isDisabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true';
 
         // Build a resilient selector
-        let selector = `[data-diffqa-id="${diffqaId}"]`;
+        let selector = `[data-diffqa-id="${CSS.escape(diffqaId)}"]`;
         if (el.id) {
-            selector = `#${el.id}`;
+            selector = `#${CSS.escape(el.id)}`;
         } else if (el.getAttribute('data-testid')) {
-            selector = `[data-testid="${el.getAttribute('data-testid')}"]`;
+            selector = `[data-testid="${CSS.escape(el.getAttribute('data-testid'))}"]`;
         }
 
         results.push({

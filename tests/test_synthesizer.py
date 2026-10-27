@@ -117,9 +117,9 @@ class TestPythonSynthesis:
             initial_url="http://localhost:3000",
             flow_title="Cart boundary test",
         )
-        assert "import pytest" in spec
-        assert "async def test_repro_" in spec
-        assert "page.goto" in spec
+        assert "from playwright.sync_api import" in spec
+        assert "def test_repro_cart_decrement_bug(page: Page):" in spec
+        compile(spec, "spec.py", "exec")
 
     def test_saves_python_to_file(self, synthesizer, sample_verdict, sample_steps, tmp_path):
         out = tmp_path / "test_repro.py"
@@ -153,3 +153,21 @@ class TestEmptySteps:
             flow_title="Empty flow",
         )
         assert "page.goto" in spec
+
+
+class TestEscaping:
+
+    def test_hostile_values_stay_inside_string_literals(self, synthesizer, sample_verdict):
+        hostile = "a`${process.exit()}`'\"\n*/"
+        step = ExecutionStep(
+            step_number=1,
+            action=AgentAction(thought=hostile, action=ActionType.FILL, selector="#q", value=hostile),
+            url_before="http://localhost:3000",
+        )
+        ts = synthesizer.synthesize_typescript(sample_verdict, [step], "http://localhost:3000", hostile)
+        # Value is emitted as a JSON (double-quoted) literal, so backticks and ${} are inert.
+        assert '.fill("a`${process.exit()}`\'\\"\\n*/")' in ts
+        assert "*/\n" not in ts.split("*/", 1)[1]  # no comment breakout after the header
+
+        py = synthesizer.synthesize_python(sample_verdict, [step], "http://localhost:3000", hostile)
+        compile(py, "spec.py", "exec")

@@ -1,7 +1,5 @@
 """Tests for interactive HTML DashboardGenerator."""
 
-import pytest
-from pathlib import Path
 from diffqa.analyzer.flow_planner import TestFlowPlan, UserFlow
 from diffqa.judge.oracle import BugSeverity, JudgeVerdict
 from diffqa.reporter.markdown import FlowReportItem
@@ -42,7 +40,7 @@ class TestDashboardGenerator:
         assert "<!DOCTYPE html>" in html
         assert "DiffQA" in html
         assert "Cart quantity bug" in html
-        assert "test('repro'" in html
+        assert "test(&#39;repro&#39;" in html
         assert "REGRESSIONS DETECTED" in html
 
         # Test file saving
@@ -51,3 +49,11 @@ class TestDashboardGenerator:
         assert save_file.exists()
         assert len(save_file.read_text(encoding="utf-8")) > 500
 
+
+    def test_untrusted_text_is_escaped(self):
+        plan = TestFlowPlan(summary="s", risk_assessment="r")
+        verdict = JudgeVerdict(flow_id="f", passed=False, title="<script>alert(1)</script>")
+        item = FlowReportItem(flow_id="f", title="t", route="/", flow_type="happy_path", passed=False, verdict=verdict)
+        html = DashboardGenerator().generate_html(plan, [item])
+        assert "<script>alert(1)</script>" not in html
+        assert "&lt;script&gt;" in html

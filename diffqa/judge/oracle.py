@@ -2,8 +2,9 @@
 
 from enum import Enum
 import logging
-from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from typing import List, Optional
+from urllib.parse import urlparse
+from pydantic import BaseModel, Field, field_validator
 
 from diffqa.agent.runner import FlowRunResult
 from diffqa.config import Settings, get_settings
@@ -39,6 +40,35 @@ class JudgeVerdict(BaseModel):
     confidence: float = 1.0
     evidence_logs: List[str] = Field(default_factory=list)
     screenshot_evidence: Optional[str] = None
+
+    # Model output is loose ("high", "95%", "Runtime Crash"); coerce rather than discard the verdict.
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _severity(cls, v: object) -> Optional[str]:
+        v = (v.value if isinstance(v, BugSeverity) else str(v or "")).strip().upper()
+        return v if v in BugSeverity.__members__ else (BugSeverity.HIGH.value if v else None)
+
+    @field_validator("bug_type", mode="before")
+    @classmethod
+    def _bug_type(cls, v: object) -> Optional[str]:
+        v = (v.value if isinstance(v, BugType) else str(v or "")).strip().lower().replace(" ", "_").replace("-", "_")
+        return v if v in {b.value for b in BugType} else (BugType.FUNCTIONAL_REGRESSION.value if v else None)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence(cls, v: object) -> float:
+        try:
+            c = float(str(v).strip().rstrip("%"))
+        except ValueError:
+            return 0.5
+        return max(0.0, min(1.0, c / 100 if c > 1 else c))
+
+    @field_validator("repro_steps", mode="before")
+    @classmethod
+    def _repro(cls, v: object) -> List[str]:
+        if not v:
+            return []
+        return [str(x) for x in v] if isinstance(v, list) else [str(v)]
 
 
 SYSTEM_JUDGE_PROMPT = """You are DiffQA Regression Judge, an expert QA oracle powered by Meta's Muse Wonder.
@@ -81,49 +111,56 @@ class RegressionJudge:
 
     async def judge_flow(self, run_result: FlowRunResult) -> JudgeVerdict:
         """Analyze run result and output a JudgeVerdict."""
-        evidence: List[str] = []
-
-        # 1. Deterministic heuristic checks
-        if run_result.uncaught_errors:
-            evidence.extend([f"Uncaught JS error: {err}" for err in run_result.uncaught_errors])
-
-        http_500s = [n for n in run_result.network_failures if n.get("status", 0) >= 500]
-        if http_500s:
-            evidence.extend([f"HTTP Server Failure: {n['status']} on {n['url']}" for n in http_500s])
-
-        action_failures = [s for s in run_result.steps if not s.success]
-        if action_failures:
-            evidence.extend([f"Action failure at step {s.step_number}: {s.error_message}" for s in action_failures])
-
-        # Check invariant violations (e.g. negative balance / negative quantity)
-        if run_result.flow.flow_type == "adversarial" and "negative" in run_result.flow.flow_id.lower():
-            evidence.append("Invariant Violated: Cart item quantity allowed negative count and subtotal balance.")
-
-        last_screenshot = run_result.all_screenshots[-1] if run_result.all_screenshots else None
-
-        # If deterministically clean and no heuristics triggered, pass quickly
-        if not evidence and run_result.success and run_result.terminal_reached:
+        flow = run_result.flow
+        if run_result.infra_error:
+            # DiffQA couldn't test this flow. Fail closed so CI doesn't go green, but don't call it an app bug.
             return JudgeVerdict(
-                flow_id=run_result.flow.flow_id,
-                passed=True,
-                verdict="PASS",
-                title=f"Flow '{run_result.flow.title}' passed all invariants.",
-                confidence=1.0,
-                screenshot_evidence=last_screenshot,
+                flow_id=flow.flow_id,
+                passed=False,
+                verdict="ERROR",
+                title=f"Not tested: {run_result.infra_error[:200]}",
+                root_cause_hypothesis="DiffQA could not complete this flow; this is not evidence of a regression.",
+                confidence=0.0,
+                evidence_logs=[run_result.infra_error],
+                screenshot_evidence=run_result.all_screenshots[-1] if run_result.all_screenshots else None,
             )
+        evidence: List[str] = [f"Uncaught JS error: {err}" for err in run_result.uncaught_errors]
+        evidence += [
+            f"HTTP Server Failure: {n['status']} on {n['url']}"
+            for n in run_result.network_failures
+            if n.get("status", 0) >= 500
+        ]
+        evidence += [
+            f"Broken API call: {n['status']} on {n.get('method', 'GET')} {n['url']}"
+            for n in self._broken_api_calls(run_result)
+        ]
+        evidence += [
+            f"Action failure at step {s.step_number}: {s.error_message}"
+            for s in run_result.steps
+            if not s.success
+        ]
+        last_screenshot = run_result.all_screenshots[-1] if run_result.all_screenshots else None
+        default_repro = [
+            f"{i + 1}. {s.action.action.value}"
+            + (f" on {s.action.target_id or s.action.selector}" if s.action.target_id or s.action.selector else "")
+            for i, s in enumerate(run_result.steps)
+        ]
 
-        # 2. Ask LLM Judge to synthesize verdict and root-cause hypothesis
         steps_summary = "\n".join(
             f"Step {s.step_number}: {s.action.action.value} on {s.action.target_id} (value={s.action.value}) -> Success={s.success}"
             for s in run_result.steps
         )
-
-        user_prompt = f"""User Flow: {run_result.flow.title}
-Goal: {run_result.flow.goal}
-Flow Invariants: {run_result.flow.invariants}
+        # Invariants like "subtotal == price * qty" are only checkable against what the page shows,
+        # so the model always sees the final visible text, even on error-free runs.
+        user_prompt = f"""User Flow: {flow.title}
+Goal: {flow.goal}
+Flow Invariants: {flow.invariants}
 
 Execution Steps:
 {steps_summary}
+
+Final Visible Page Text:
+{run_result.final_page_text or "(unavailable)"}
 
 Uncaught Errors:
 {run_result.uncaught_errors}
@@ -142,42 +179,75 @@ Evaluate whether this constitutes a bug or regression."""
         ]
 
         try:
-            verdict_data = await self.llm.complete_json(messages, model=self.settings.judge_model)
-            passed = verdict_data.get("verdict", "").upper() == "PASS"
-            
-            # Map repro steps if missing
-            repro = verdict_data.get("repro_steps") or [
-                f"{i+1}. {s.action.action.value} on {s.action.target_id or s.action.selector}"
-                for i, s in enumerate(run_result.steps)
-            ]
-
+            data = await self.llm.complete_json(messages, model=self.settings.judge_model)
+            verdict = str(data.get("verdict", "FAIL")).upper()
+            passed = verdict == "PASS" and not self._hard_failure(run_result)
+            if passed:
+                return JudgeVerdict(
+                    flow_id=flow.flow_id,
+                    passed=True,
+                    title=data.get("title") or f"Flow '{flow.title}' passed all invariants.",
+                    confidence=data.get("confidence", 0.9),
+                    evidence_logs=evidence,
+                    screenshot_evidence=last_screenshot,
+                )
             return JudgeVerdict(
-                flow_id=run_result.flow.flow_id,
-                passed=passed,
-                verdict=verdict_data.get("verdict", "FAIL" if not passed else "PASS"),
-                bug_type=verdict_data.get("bug_type") or (BugType.RUNTIME_CRASH if run_result.uncaught_errors else BugType.FUNCTIONAL_REGRESSION),
-                title=verdict_data.get("title") or f"Regression in {run_result.flow.title}",
-                root_cause_hypothesis=verdict_data.get("root_cause_hypothesis"),
-                severity=verdict_data.get("severity") or BugSeverity.HIGH,
-                repro_steps=repro,
-                confidence=float(verdict_data.get("confidence", 0.9)),
+                flow_id=flow.flow_id,
+                passed=False,
+                verdict="FAIL" if verdict == "PASS" else verdict,
+                bug_type=data.get("bug_type") or self._default_bug_type(run_result),
+                title=data.get("title") or f"Regression in {flow.title}",
+                root_cause_hypothesis=data.get("root_cause_hypothesis"),
+                severity=data.get("severity") or BugSeverity.HIGH,
+                repro_steps=data.get("repro_steps") or default_repro,
+                confidence=data.get("confidence", 0.9),
                 evidence_logs=evidence,
                 screenshot_evidence=last_screenshot,
             )
         except Exception as e:
             logger.error(f"LLM Judge call failed: {e}")
-            # Fallback deterministic verdict
+            # Without a model we can only trust hard evidence.
+            failed = bool(evidence)
             return JudgeVerdict(
-                flow_id=run_result.flow.flow_id,
-                passed=False,
-                verdict="FAIL",
-                bug_type=BugType.RUNTIME_CRASH if run_result.uncaught_errors else BugType.FUNCTIONAL_REGRESSION,
-                title=f"Failure detected in {run_result.flow.title}",
-                root_cause_hypothesis=f"Errors encountered during execution: {evidence}",
-                severity=BugSeverity.HIGH,
-                repro_steps=[f"Step {s.step_number}: {s.action.action.value}" for s in run_result.steps],
-                confidence=0.85,
+                flow_id=flow.flow_id,
+                passed=not failed,
+                verdict="FAIL" if failed else "WARNING",
+                bug_type=self._default_bug_type(run_result) if failed else None,
+                title=f"Failure detected in {flow.title}" if failed else f"Judge unavailable for {flow.title}: {e}",
+                root_cause_hypothesis=f"Errors encountered during execution: {evidence}" if failed else None,
+                severity=BugSeverity.HIGH if failed else None,
+                repro_steps=default_repro if failed else [],
+                confidence=0.5,
                 evidence_logs=evidence,
                 screenshot_evidence=last_screenshot,
             )
 
+    @staticmethod
+    def _default_bug_type(run_result: FlowRunResult) -> BugType:
+        return BugType.RUNTIME_CRASH if run_result.uncaught_errors else BugType.FUNCTIONAL_REGRESSION
+
+    @staticmethod
+    def _hard_failure(run_result: FlowRunResult) -> bool:
+        """Evidence strong enough to fail the flow even if the model says PASS."""
+        if run_result.uncaught_errors or any(n.get("status", 0) >= 500 for n in run_result.network_failures):
+            return True
+        return bool(RegressionJudge._broken_api_calls(run_result))
+
+    @staticmethod
+    def _broken_api_calls(run_result: FlowRunResult) -> List[dict]:
+        """Same-origin fetch/XHR calls that returned 4xx: usually a renamed endpoint or a bad payload.
+
+        Not included: auth/rate-limit statuses (normal when browsing unauthenticated), static assets
+        like a missing favicon, third-party hosts, aborted requests, and failed agent actions (those
+        are more often the agent's mistake than the app's).
+        """
+        if not run_result.steps:
+            return []
+        site = urlparse(run_result.steps[0].url_before).netloc
+        return [
+            n for n in run_result.network_failures
+            if 400 <= n.get("status", 0) < 500
+            and n.get("status") not in (401, 403, 407, 429)
+            and n.get("resource_type") in ("fetch", "xhr")
+            and urlparse(n.get("url", "")).netloc == site
+        ]

@@ -2,7 +2,7 @@
 
 import pytest
 
-from diffqa.analyzer.diff_parser import DiffParser, ParsedDiff
+from diffqa.analyzer.diff_parser import DiffParser
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────

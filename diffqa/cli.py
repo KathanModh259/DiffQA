@@ -2,45 +2,43 @@
 
 import asyncio
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
+
+import httpx
 import typer
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
-# Ensure UTF-8 console encoding on Windows to prevent charmap UnicodeEncodeErrors
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-# Ensure workspace root is in sys.path
-WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-if str(WORKSPACE_ROOT) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE_ROOT))
-
+from benchmarks.serve import run_server, serve_in_background
 from diffqa.agent.browser import BrowserController
-from diffqa.agent.runner import BrowserAgentRunner
+from diffqa.agent.explorer import SiteExplorer
 from diffqa.analyzer.diff_parser import DiffParser
 from diffqa.analyzer.flow_planner import FlowPlanner, TestFlowPlan
+from diffqa.benchmark import BenchmarkRunner, build_testbed
 from diffqa.config import Settings
-from diffqa.judge.oracle import RegressionJudge
-from diffqa.llm.client import LLMClient
-from diffqa.reporter.markdown import FlowReportItem, PRReportGenerator
-from diffqa.reporter.dashboard import DashboardGenerator
 from diffqa.judge.superhuman import SuperhumanOracle
-from diffqa.synthesizer.test_writer import PlaywrightTestSynthesizer
-from diffqa.benchmark import BenchmarkRunner
-from benchmarks.serve import run_server
-from diffqa.agent.explorer import SiteExplorer
+from diffqa.llm.client import LLMClient
+from diffqa.pipeline import execute_plan
+from diffqa.reporter.dashboard import DashboardGenerator
+from diffqa.reporter.markdown import PRReportGenerator
+
+# Windows consoles default to a legacy codepage that can't encode the report's emoji.
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+SCENARIOS_DIR = Path(__file__).resolve().parent.parent / "benchmarks" / "scenarios"
+PROVIDER_HELP = "Model provider (meta, fireworks, baseten, modal, ollama, mock)"
 
 app = typer.Typer(
     name="diffqa",
     help="Autonomous PR Regression Testing Agent powered by Meta Models & Playwright",
     add_completion=False,
+    pretty_exceptions_enable=False,
 )
 console = Console()
 
@@ -49,23 +47,20 @@ console = Console()
 def scan(
     diff: Path = typer.Option(..., "--diff", "-d", help="Path to unified git diff or patch file"),
     url: str = typer.Option("http://localhost:3000", "--url", "-u", help="Target preview URL"),
-    provider: str = typer.Option("meta", "--provider", "-p", help="Model provider (meta, fireworks, baseten, modal, mock)"),
+    provider: str = typer.Option("meta", "--provider", "-p", help=PROVIDER_HELP),
 ):
     """Scan a git diff and preview the planned test flows without running browser."""
-    settings = Settings(provider=provider)  # type: ignore
-    llm = LLMClient(settings=settings)
-    parser = DiffParser()
+    llm = LLMClient(settings=Settings(provider=provider))  # type: ignore[arg-type]
 
     console.print(Panel.fit(f"[bold cyan]DiffQA Diff Scanner[/bold cyan]\nDiff: [yellow]{diff}[/yellow] | Preview: [green]{url}[/green]"))
 
-    parsed = parser.parse_file(diff)
+    parsed = DiffParser().parse_file(diff)
     console.print(f"[bold]Detected {len(parsed.files)} modified files (+{parsed.total_added}/-{parsed.total_removed}):[/bold]")
     for f in parsed.files:
         console.print(f"  • {f.path} [dim](UI: {f.is_ui_component})[/dim]")
 
-    planner = FlowPlanner(llm_client=llm)
-    with console.status("[bold green]Synthesizing test flows via Meta Muse Code...[/bold green]"):
-        plan = asyncio.run(planner.plan_flows(parsed, preview_url=url))
+    with console.status("[bold green]Planning test flows...[/bold green]"):
+        plan = asyncio.run(FlowPlanner(llm_client=llm).plan_flows(parsed, preview_url=url))
 
     console.print(f"\n[bold green]Diff Summary:[/bold green] {plan.summary}")
     console.print(f"[bold red]Risk Assessment:[/bold red] {plan.risk_assessment}\n")
@@ -75,7 +70,6 @@ def scan(
     table.add_column("Type", style="magenta")
     table.add_column("Route", style="yellow")
     table.add_column("Goal", style="white")
-
     for f in plan.flows:
         table.add_row(f.flow_id, f.flow_type, f.route, f.goal)
     console.print(table)
@@ -86,19 +80,20 @@ def run(
     diff: Path = typer.Option(..., "--diff", "-d", help="Path to unified git diff or patch file"),
     url: str = typer.Option("http://localhost:3000", "--url", "-u", help="Target preview URL"),
     output: Path = typer.Option(Path("./diffqa_output"), "--output", "-o", help="Output directory for reports and specs"),
-    provider: str = typer.Option("meta", "--provider", "-p", help="Model provider (meta, fireworks, baseten, modal, ollama, mock)"),
+    provider: str = typer.Option("meta", "--provider", "-p", help=PROVIDER_HELP),
     headless: bool = typer.Option(True, "--headless/--headed", help="Run browser in headless mode"),
 ):
-    """Execute DiffQA: parse diff, run autonomous browser flows, judge regressions, and synthesize tests."""
-    asyncio.run(_run_pipeline(diff, url, output, provider, headless))
+    """Execute DiffQA: parse diff, run autonomous browser flows, judge regressions, and synthesize tests.
+
+    Exits with status 1 when any flow fails, so it can gate CI.
+    """
+    failed = asyncio.run(_run_pipeline(diff, url, output, provider, headless))
+    raise typer.Exit(code=1 if failed else 0)
 
 
-async def _run_pipeline(diff_path: Path, url: str, output_dir: Path, provider: str, headless: bool):
-    settings = Settings(
-        provider=provider,  # type: ignore
-        headless=headless,
-        output_dir=output_dir,
-    )
+async def _run_pipeline(diff_path: Path, url: str, output_dir: Path, provider: str, headless: bool) -> int:
+    """Run the full pipeline and return the number of failed flows."""
+    settings = Settings(provider=provider, headless=headless, output_dir=output_dir)  # type: ignore[arg-type]
     llm = LLMClient(settings=settings)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -107,101 +102,58 @@ async def _run_pipeline(diff_path: Path, url: str, output_dir: Path, provider: s
         f"Diff: [yellow]{diff_path}[/yellow] | Preview URL: [green]{url}[/green] | Provider: [magenta]{provider}[/magenta]"
     ))
 
-    # 1. Parse Diff
-    parser = DiffParser()
-    parsed_diff = parser.parse_file(diff_path)
-    console.print(f"✅ Parsed diff: {len(parsed_diff.files)} files modified.")
+    parsed_diff = DiffParser().parse_file(diff_path)
+    console.print(f"Parsed diff: {len(parsed_diff.files)} files modified.")
+    if not parsed_diff.files:
+        console.print("[yellow]The diff contains no file changes; running a smoke test of the preview.[/yellow]")
 
-    # 2. Plan Flows
-    planner = FlowPlanner(llm_client=llm)
-    with console.status("[bold green]Planning user flows and invariants with Meta Muse Code...[/bold green]"):
-        plan = await planner.plan_flows(parsed_diff, preview_url=url)
-    console.print(f"📋 Generated [bold]{len(plan.flows)}[/bold] test flows.")
-
-    # 3. Autonomous Browser Execution
     controller = BrowserController(settings=settings)
     await controller.start()
-
-    runner = BrowserAgentRunner(controller=controller, llm_client=llm, settings=settings)
-    judge = RegressionJudge(llm_client=llm, settings=settings)
-    synthesizer = PlaywrightTestSynthesizer()
-
-    report_items = []
-
     try:
-        for flow in plan.flows:
-            console.print(f"\n🚀 [bold]Executing Flow:[/bold] {flow.title} [dim]({flow.flow_type})[/dim]")
-            run_result = await runner.run_flow(flow, base_url=url)
+        # Fail fast on an unreachable preview before spending model credits on planning.
+        try:
+            await controller.navigate(url)
+        except Exception as e:
+            console.print(f"[bold red]Cannot reach preview URL {url}:[/bold red] {str(e).splitlines()[0]}")
+            raise typer.Exit(code=2)
 
-            # Judge regression
-            verdict = await judge.judge_flow(run_result)
+        with console.status("[bold green]Planning user flows and invariants...[/bold green]"):
+            plan = await FlowPlanner(llm_client=llm).plan_flows(parsed_diff, preview_url=url)
+        console.print(f"Generated [bold]{len(plan.flows)}[/bold] test flows.")
 
-            spec_ts = None
-            spec_py = None
-            if not verdict.passed:
-                console.print(f"  ❌ [bold red]REGRESSION DETECTED:[/bold red] {verdict.title}")
-                # Synthesize Playwright test
-                spec_ts_path = output_dir / "specs" / f"{flow.flow_id}.spec.ts"
-                spec_ts = synthesizer.synthesize_typescript(
-                    verdict=verdict,
-                    steps=run_result.steps,
-                    initial_url=f"{url.rstrip('/')}/{flow.route.lstrip('/')}",
-                    flow_title=flow.title,
-                    invariants=flow.invariants,
-                    output_file=spec_ts_path,
-                )
-                console.print(f"  🧪 Synthesized Playwright spec: [yellow]{spec_ts_path}[/yellow]")
-            else:
-                console.print(f"  ✅ [bold green]PASSED[/bold green]")
-
-            report_items.append(FlowReportItem(
-                flow_id=flow.flow_id,
-                title=flow.title,
-                route=flow.route,
-                flow_type=flow.flow_type,
-                passed=verdict.passed,
-                verdict=verdict,
-                spec_code_ts=spec_ts,
-                spec_code_py=spec_py,
-                duration_seconds=run_result.duration_seconds,
-            ))
+        report_items = await execute_plan(plan, url, controller, llm, settings, output_dir)
     finally:
         await controller.close()
 
-    # 4. Generate PR Markdown Report
     reporter = PRReportGenerator()
     report_md = reporter.generate_report(plan, report_items, preview_url=url)
-    report_path = output_dir / "DIFFQA_REPORT.md"
-    reporter.save_report(report_md, report_path)
+    report_path = reporter.save_report(report_md, output_dir / "DIFFQA_REPORT.md")
 
     dashboard = DashboardGenerator()
-    dash_html = dashboard.generate_html(plan, report_items, preview_url=url)
-    dash_path = output_dir / "DIFFQA_DASHBOARD.html"
-    dashboard.save_dashboard(dash_html, dash_path)
+    dash_path = dashboard.save_dashboard(
+        dashboard.generate_html(plan, report_items, preview_url=url), output_dir / "DIFFQA_DASHBOARD.html"
+    )
 
-    console.print(f"\n[Report] Saved PR Report: [bold cyan]{report_path}[/bold cyan]")
-    console.print(f"[Report] Saved Interactive Dashboard: [bold yellow]{dash_path}[/bold yellow]")
-    console.print("\n" + "=" * 60 + "\n")
-    console.print(report_md)
+    console.print(f"\nSaved PR Report: [bold cyan]{report_path}[/bold cyan]")
+    console.print(f"Saved Interactive Dashboard: [bold yellow]{dash_path}[/bold yellow]")
+    console.rule()
+    console.print(Markdown(report_md))
+    return sum(1 for i in report_items if not i.passed)
 
 
 @app.command()
 def eval(
-    benchmark: Path = typer.Option(Path("./benchmarks/scenarios"), "--benchmark", "-b", help="Path to directory containing seeded .diff scenarios"),
-    url: str = typer.Option("http://localhost:3000", "--url", "-u", help="Testbed app preview URL"),
-    provider: str = typer.Option("mock", "--provider", "-p", help="Model provider (meta, fireworks, baseten, modal, mock)"),
+    benchmark: Path = typer.Option(SCENARIOS_DIR, "--benchmark", "-b", help="Directory of seeded .diff scenarios"),
+    provider: str = typer.Option("mock", "--provider", "-p", help=PROVIDER_HELP),
+    headless: bool = typer.Option(True, "--headless/--headed", help="Run browser in headless mode"),
 ):
-    """Run quantitative benchmark evaluation on seeded regression PR diffs."""
+    """Apply each seeded bug diff to the testbed, run the full pipeline, and score detection."""
     console.print(Panel.fit(
         f"[bold cyan]DiffQA Benchmark Evaluation Harness[/bold cyan]\n"
         f"Scenarios: [yellow]{benchmark}[/yellow] | Provider: [magenta]{provider}[/magenta]"
     ))
-
-    runner = BenchmarkRunner(scenarios_dir=benchmark, testbed_url=url, provider=provider)
-    with console.status("[bold green]Evaluating benchmark scenarios...[/bold green]"):
-        results = asyncio.run(runner.run_benchmark())
-
-    runner.print_scorecard(results)
+    runner = BenchmarkRunner(scenarios_dir=benchmark, provider=provider, headless=headless)
+    runner.print_scorecard(asyncio.run(runner.run_benchmark()))
 
 
 @app.command()
@@ -209,58 +161,40 @@ def serve(
     port: int = typer.Option(3000, "--port", "-p", help="Port to run the testbed web app on"),
 ):
     """Launch the local QuickShop testbed web application."""
-    console.print(Panel.fit(
-        f"[bold cyan]Launching DiffQA Testbed Web App[/bold cyan]\n"
-        f"URL: [green]http://localhost:{port}[/green]"
-    ))
     run_server(port=port)
 
 
 @app.command()
 def demo(
-    port: int = typer.Option(3000, "--port", "-p", help="Port to run demo testbed on"),
-    provider: str = typer.Option("mock", "--provider", help="Model provider to use (default: mock for instant offline demo)"),
+    scenario: str = typer.Option("broken_promo_uncaught_error", "--scenario", "-s", help="Seeded bug diff to inject (file stem in benchmarks/scenarios)"),
+    provider: str = typer.Option("mock", "--provider", help="Model provider (default: mock, fully offline)"),
     headless: bool = typer.Option(True, "--headless/--headed", help="Run browser in headless or headed mode"),
+    output: Path = typer.Option(Path("./diffqa_output"), "--output", "-o", help="Output directory for reports and specs"),
 ):
-    """Run an automated end-to-end demo of DiffQA against a seeded buggy PR."""
-    import threading
-    import socketserver
-    from benchmarks.serve import Handler, DIRECTORY
+    """End-to-end demo: serve the testbed with a seeded bug applied, then run DiffQA against it."""
+    diff_path = SCENARIOS_DIR / f"{scenario}.diff"
+    if not diff_path.exists():
+        raise typer.BadParameter(f"No scenario '{scenario}' in {SCENARIOS_DIR}")
 
-    console.print(Panel.fit(
-        "[bold cyan]DiffQA Live End-to-End Demo[/bold cyan]\n"
-        "[dim]Spinning up local testbed server and running autonomous browser testing against buggy PR diff...[/dim]"
-    ))
-
-    # 1. Start background testbed server
-    server = socketserver.TCPServer(("", port), Handler)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-    console.print(f"⚡ Local testbed server active at [green]http://localhost:{port}[/green]")
-
-    try:
-        # 2. Run DiffQA pipeline against seeded regression diff
-        diff_path = Path("benchmarks/scenarios/negative_cart_qty.diff")
-        out_dir = Path("diffqa_output")
-
-        asyncio.run(_run_pipeline(
-            diff_path=diff_path,
-            url=f"http://localhost:{port}",
-            output_dir=out_dir,
-            provider=provider,
-            headless=headless,
+    with tempfile.TemporaryDirectory() as site_dir:
+        build_testbed(diff_path, Path(site_dir))
+        server, url = serve_in_background(Path(site_dir))
+        console.print(Panel.fit(
+            f"[bold cyan]DiffQA Live Demo[/bold cyan]\n"
+            f"Testbed with [yellow]{scenario}[/yellow] applied, serving at [green]{url}[/green]"
         ))
-    finally:
-        server.shutdown()
-        server.server_close()
-        console.print("[dim]Local testbed server stopped.[/dim]")
+        try:
+            asyncio.run(_run_pipeline(diff_path, url, output, provider, headless))
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 @app.command()
 def explore(
     url: str = typer.Argument(..., help="Target website URL to test (e.g. https://example.com)"),
     output: Path = typer.Option(Path("./diffqa_output"), "--output", "-o", help="Directory for reports and specs"),
-    provider: str = typer.Option("meta", "--provider", "-p", help="Model provider (meta, fireworks, baseten, modal, mock)"),
+    provider: str = typer.Option("meta", "--provider", "-p", help=PROVIDER_HELP),
     headless: bool = typer.Option(False, "--headless/--headed", help="Run browser in headless or headed mode (headed recommended for login)"),
     wait_for_login: bool = typer.Option(True, "--login/--no-login", help="Detect login page and wait for user authentication if needed"),
     user: Optional[str] = typer.Option(None, "--user", "-u", help="Username or email for automated login"),
@@ -269,17 +203,8 @@ def explore(
     auth_file: Path = typer.Option(Path(".diffqa_auth.json"), "--auth-file", help="Path to cached session cookies state"),
 ):
     """Autonomously explore and test ANY website like an expert QA engineer."""
-    settings = Settings(
-        provider=provider,  # type: ignore
-        headless=headless,
-        output_dir=output,
-    )
-    llm = LLMClient(settings=settings)
-    explorer = SiteExplorer(
-        settings=settings,
-        llm_client=llm,
-        auth_state_path=auth_file,
-    )
+    settings = Settings(provider=provider, headless=headless, output_dir=output)  # type: ignore[arg-type]
+    explorer = SiteExplorer(settings=settings, llm_client=LLMClient(settings=settings), auth_state_path=auth_file)
     asyncio.run(explorer.explore(
         target_url=url,
         output_dir=output,
@@ -292,62 +217,60 @@ def explore(
 
 @app.command()
 def audit(
-    url: str = typer.Argument(..., help="Website URL to audit for superhuman invariants (e.g. https://example.com)"),
+    url: str = typer.Argument(..., help="Website URL to audit (e.g. https://example.com)"),
     output: Path = typer.Option(Path("./diffqa_output"), "--output", "-o", help="Directory for reports and dashboard"),
     headless: bool = typer.Option(True, "--headless/--headed", help="Run browser in headless or headed mode"),
 ):
-    """Run an instant Superhuman Invariant Audit (visual shifts, a11y, broken assets, network/console issues)."""
+    """Run an instant page audit (layout overflow, a11y, broken assets, network/console errors)."""
     asyncio.run(_run_audit(url, output, headless))
 
 
 async def _run_audit(url: str, output_dir: Path, headless: bool):
     settings = Settings(headless=headless, output_dir=output_dir)
     controller = BrowserController(settings=settings)
-    oracle = SuperhumanOracle()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    console.print(Panel.fit(
-        f"[bold cyan]DiffQA Superhuman Invariant Audit[/bold cyan]\n"
-        f"Auditing: [green]{url}[/green] for hidden layout, a11y, asset, and network bugs..."
-    ))
+    console.print(Panel.fit(f"[bold cyan]DiffQA Page Audit[/bold cyan]\nAuditing: [green]{url}[/green]"))
 
     await controller.start()
     try:
         await controller.navigate(url)
-        report = await oracle.audit_page(
+        report = await SuperhumanOracle().audit_page(
             controller.page,
             network_errors=controller.network_errors,
-            console_errors=[log["text"] for log in controller.console_logs if log["type"] == "error"],
+            console_errors=controller.page_errors
+            + [log["text"] for log in controller.console_logs if log["type"] == "error"],
         )
 
-        table = Table(title=f"Superhuman Audit Scorecard ({report.quality_score}/100)")
+        table = Table(title=f"Audit Scorecard ({report.quality_score}/100)")
         table.add_column("Severity", style="bold")
         table.add_column("Category", style="cyan")
         table.add_column("Message", style="white")
         table.add_column("Selector", style="yellow")
-
         for issue in report.issues:
             sev_color = "red" if issue.severity in ("CRITICAL", "HIGH") else "yellow"
-            table.add_row(
-                f"[{sev_color}]{issue.severity}[/{sev_color}]",
-                issue.category,
-                issue.message[:80],
-                issue.selector or "-",
-            )
+            table.add_row(f"[{sev_color}]{issue.severity}[/{sev_color}]", issue.category, issue.message[:80], issue.selector or "-")
         console.print(table)
-        console.print(f"\n[bold]Summary:[/bold] Quality Score: [bold magenta]{report.quality_score}/100[/bold magenta] | Total Issues: [bold]{report.total_issues}[/bold]")
+        console.print(f"\n[bold]Quality Score:[/bold] [bold magenta]{report.quality_score}/100[/bold magenta] | Total Issues: [bold]{report.total_issues}[/bold]")
 
-        # Generate HTML dashboard
         dashboard = DashboardGenerator()
-        plan = TestFlowPlan(summary=f"Superhuman Audit of {url}", affected_routes=["/"], risk_assessment="Audit", flows=[])
-        dash_html = dashboard.generate_html(plan, [], preview_url=url, audit=report)
-        dash_file = output_dir / "DIFFQA_AUDIT_DASHBOARD.html"
-        dashboard.save_dashboard(dash_html, dash_file)
+        plan = TestFlowPlan(summary=f"Page audit of {url}", affected_routes=["/"], risk_assessment="Audit", flows=[])
+        dash_file = dashboard.save_dashboard(
+            dashboard.generate_html(plan, [], preview_url=url, audit=report), output_dir / "DIFFQA_AUDIT_DASHBOARD.html"
+        )
         console.print(f"Interactive Audit Dashboard: [bold yellow]{dash_file}[/bold yellow]")
-
     finally:
         await controller.close()
 
 
+def main() -> None:
+    """Console entry point: expected setup problems print one actionable line, not a traceback."""
+    try:
+        app()
+    except (ValueError, RuntimeError, FileNotFoundError, httpx.HTTPError) as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        sys.exit(2)
+
+
 if __name__ == "__main__":
-    app()
+    main()

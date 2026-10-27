@@ -1,8 +1,8 @@
 """Browser controller managing Playwright instance, diagnostics listeners, and actions."""
 
 import logging
-import time
 from pathlib import Path
+from urllib.parse import urljoin
 from typing import Any, Dict, List, Optional
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
@@ -10,6 +10,13 @@ from diffqa.agent.actions import AgentAction, ActionType
 from diffqa.config import Settings, get_settings
 
 logger = logging.getLogger("diffqa.browser")
+
+
+def _to_int(value: Optional[str], default: int) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
 
 class BrowserController:
@@ -30,9 +37,16 @@ class BrowserController:
         """Initialize the Playwright engine and launch browser, optionally loading cached session cookies."""
         self._playwright = await async_playwright().start()
         browser_type = getattr(self._playwright, self.settings.browser_type)
-        self._browser = await browser_type.launch(
-            headless=self.settings.headless,
-        )
+        try:
+            self._browser = await browser_type.launch(headless=self.settings.headless)
+        except Exception as e:
+            await self.close()
+            if "Executable doesn't exist" in str(e):
+                raise RuntimeError(
+                    f"Playwright's {self.settings.browser_type} is not installed. "
+                    f"Run: playwright install {self.settings.browser_type}"
+                ) from None
+            raise
         context_kwargs: Dict[str, Any] = {
             "viewport": {
                 "width": self.settings.viewport_width,
@@ -40,12 +54,22 @@ class BrowserController:
             }
         }
         if storage_state_path and Path(storage_state_path).exists():
-            context_kwargs["storage_state"] = str(storage_state_path)
-            logger.info(f"Loaded cached browser authentication state from {storage_state_path}")
+            try:
+                self._context = await self._browser.new_context(storage_state=str(storage_state_path), **context_kwargs)
+                logger.info(f"Loaded cached browser authentication state from {storage_state_path}")
+            except Exception as e:
+                logger.warning(f"Ignoring unreadable session file {storage_state_path}: {e}")
+        if not self._context:
+            self._context = await self._browser.new_context(**context_kwargs)
+        await self.recover()
 
-        self._context = await self._browser.new_context(**context_kwargs)
-        self._page = await self._context.new_page()
-        self._attach_listeners()
+    async def recover(self) -> None:
+        """Open a fresh page if the current one is missing or crashed/closed."""
+        if not self._context:
+            raise RuntimeError("Browser context not started.")
+        if self._page is None or self._page.is_closed():
+            self._page = await self._context.new_page()
+            self._attach_listeners()
 
     async def save_storage_state(self, path: Path | str) -> None:
         """Save browser session cookies and localStorage to disk."""
@@ -85,6 +109,7 @@ class BrowserController:
                     "method": response.request.method,
                     "status": response.status,
                     "status_text": response.status_text,
+                    "resource_type": response.request.resource_type,
                 })
 
         self._page.on("console", on_console)
@@ -110,19 +135,17 @@ class BrowserController:
         await self.page.screenshot(path=str(path), full_page=False)
         return str(path)
 
-    async def execute_action(self, action: AgentAction, selector_fallback: Optional[str] = None) -> None:
+    async def execute_action(self, action: AgentAction) -> None:
         """Execute the requested action against the page."""
         target_selector = action.selector
         if not target_selector and action.target_id:
             target_selector = f"[data-diffqa-id='{action.target_id}']"
-        if not target_selector and selector_fallback:
-            target_selector = selector_fallback
 
         timeout = self.settings.action_timeout_ms
 
         if action.action == ActionType.NAVIGATE:
             if action.value:
-                await self.navigate(action.value)
+                await self.navigate(urljoin(self.page.url, action.value))
         elif action.action == ActionType.CLICK:
             if not target_selector:
                 raise ValueError("Target selector or target_id required for click action.")
@@ -133,7 +156,7 @@ class BrowserController:
                 raise ValueError("Target selector or target_id required for fill action.")
             await self.page.fill(target_selector, action.value or "", timeout=timeout)
         elif action.action == ActionType.SCROLL:
-            pixels = int(action.value) if action.value and action.value.isdigit() else 400
+            pixels = _to_int(action.value, 400)
             await self.page.evaluate(f"window.scrollBy(0, {pixels});")
             await self.page.wait_for_timeout(200)
         elif action.action == ActionType.PRESS:
@@ -143,7 +166,7 @@ class BrowserController:
             else:
                 await self.page.keyboard.press(key)
         elif action.action == ActionType.WAIT:
-            ms = int(action.value) if action.value and action.value.isdigit() else 1000
+            ms = min(max(_to_int(action.value, 1000), 0), 10_000)  # a model asking for 60s would stall the run
             await self.page.wait_for_timeout(ms)
         elif action.action == ActionType.ASSERT:
             # Assertion action handled in execution step
@@ -162,11 +185,17 @@ class BrowserController:
         return res
 
     async def close(self) -> None:
-        """Gracefully close browser and playwright instances."""
-        if self._context:
-            await self._context.close()
-        if self._browser:
-            await self._browser.close()
+        """Close everything that was started; safe to call twice or after a failed start."""
+        for closer in (self._context, self._browser):
+            if closer:
+                try:
+                    await closer.close()
+                except Exception as e:
+                    logger.debug(f"Ignoring error while closing browser: {e}")
         if self._playwright:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception as e:
+                logger.debug(f"Ignoring error while stopping Playwright: {e}")
+        self._context = self._browser = self._playwright = self._page = None
 

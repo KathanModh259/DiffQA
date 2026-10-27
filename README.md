@@ -6,7 +6,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Playwright](https://img.shields.io/badge/Playwright-Automated_Browser-45ba4b.svg?logo=playwright&logoColor=white)](https://playwright.dev/)
-[![Tests: 57 Passing](https://img.shields.io/badge/Tests-57%20Passing-brightgreen.svg)](tests/)
 [![Docker: Ready](https://img.shields.io/badge/Docker-Ready-2496ED.svg?logo=docker&logoColor=white)](Dockerfile)
 [![Powered by: Meta Model API](https://img.shields.io/badge/Powered%20by-Meta%20Model%20API-0081FB.svg?logo=meta&logoColor=white)](https://about.meta.com/)
 
@@ -104,7 +103,8 @@ DiffQA/
 │   │   └── markdown.py      # Rich PR comment formatter
 │   ├── llm/                 # Unified LLM provider layer
 │   │   └── client.py        # Meta Model API, Fireworks, Baseten, Modal, Ollama, Mock
-│   └── benchmark.py         # Evaluation benchmark harness
+│   ├── pipeline.py          # Shared run → judge → synthesize loop
+│   └── benchmark.py         # Applies seeded diffs to the testbed and runs the full pipeline
 ├── benchmarks/              # Seeded bug evaluation testbed
 │   ├── testbed_app/         # QuickShop e-commerce store with SPA routing
 │   │   └── index.html
@@ -115,7 +115,7 @@ DiffQA/
 │   │   ├── silent_checkout_failure.diff
 │   │   └── wrong_total_calculation.diff
 │   └── serve.py             # Built-in local HTTP server with SPA routing
-├── tests/                   # Comprehensive unit & integration test suite (48 tests)
+├── tests/                   # Unit test suite
 │   ├── test_diff_parser.py
 │   ├── test_flow_planner.py
 │   ├── test_synthesizer.py
@@ -158,12 +158,12 @@ Create or edit `.env`:
 DIFFQA_PROVIDER=mock
 
 # When using live Meta or partner API keys:
-# META_API_KEY=your_key_here
+# MODEL_API_KEY=your_meta_model_api_key
 # FIREWORKS_API_KEY=your_fireworks_key
 # BASETEN_API_KEY=your_baseten_key
 # MODAL_API_KEY=your_modal_key
 ```
-*(Note: `DIFFQA_PROVIDER=mock` works completely offline out-of-the-box with zero API cost!)*
+*(`DIFFQA_PROVIDER=mock` runs fully offline: a deterministic agent clicks every visible button once and the judge fails a flow only on hard evidence — uncaught errors, HTTP 5xx, failed actions. Selecting a real provider without its API key is an error, never a silent fallback to mock.)*
 
 ---
 
@@ -173,15 +173,15 @@ DIFFQA_PROVIDER=mock
 | :--- | :--- |
 | `diffqa explore <url>` | **Test ANY website autonomously**: navigates to the URL, handles login/SSO barriers (interactive or automated), explores workflows, and synthesizes Playwright tests for bugs found. |
 | `diffqa explore <url> --headed` | Runs autonomous exploration with browser window visible. |
-| `diffqa explore <url> -u <email> -p <pass>` | Automated login using provided credentials before exploring. |
-| `diffqa demo` | **Full end-to-end demo**: spins up local testbed app, executes browser agent, catches bug, synthesizes Playwright test, and generates PR comment. |
+| `diffqa explore <url> -u <email> --password <pass>` | Automated login using provided credentials before exploring. |
+| `diffqa demo` | **Full end-to-end demo**: serves the testbed with a seeded bug applied (`--scenario`), runs the browser agent against it, and reports what it actually caught. |
 | `diffqa demo --headed` | Runs demo with browser window visibly open on screen. |
-| `diffqa eval` | Runs the quantitative evaluation benchmark across all seeded PR bug scenarios. |
+| `diffqa eval` | Applies every seeded bug diff to the testbed, runs the full pipeline against each, and scores recall plus false positives on a clean baseline. |
 | `diffqa scan --diff <file>` | Parses diff and previews planned flows without opening browser. |
-| `diffqa run --diff <file> --url <url>` | Runs autonomous QA on any custom PR diff and preview URL. |
+| `diffqa run --diff <file> --url <url>` | Runs autonomous QA on any custom PR diff and preview URL. Exits 1 if any flow fails. |
 | `diffqa serve --port 3000` | Starts the QuickShop testbed web application locally. |
 | `diffqa audit <url>` | **Superhuman Invariant Audit**: catches layout overflow, text clipping, broken assets, WCAG a11y violations, and network errors. Generates interactive HTML dashboard. |
-| `pytest` | Runs the 57-test automated test suite. |
+| `python -m pytest` | Runs unit tests plus real-browser end-to-end tests (skipped if Chromium is not installed). |
 
 ---
 
@@ -204,38 +204,30 @@ diffqa explore https://app.example.com --headed
 diffqa explore https://app.example.com --auth-file .diffqa_auth.json
 
 # 4. Or pass credentials directly for hands-free automated login:
-diffqa explore https://app.example.com -u "admin@example.com" -p "Secret123!"
+diffqa explore https://app.example.com -u "admin@example.com" --password "Secret123!"
 ```
 
 ---
 
 ## 📊 Evaluation & Benchmark Scorecard
 
-DiffQA follows an **eval-first** design philosophy: judged by measured bug-detection recall and precision, not just a static demo.
+`diffqa eval` applies each seeded bug diff in `benchmarks/scenarios/` to a temporary copy of the testbed, serves it, and runs the real plan → browser agent → judge pipeline. An unpatched baseline run measures false positives.
 
-Running `diffqa eval`:
+Offline result with `--provider mock`:
 ```text
-┌──────────────────────────────────────────────────┐
-│ DiffQA Benchmark Evaluation Harness              │
-│ Scenarios: benchmarks/scenarios | Provider: mock │
-└──────────────────────────────────────────────────┘
-                🏆 DiffQA Seeded Regression Benchmark Scorecard                
-┌──────────────────┬──────────────┬──────────────┬──────────────┬──────────┬──────────────┬───────┐
-│ Scenario         │ Diff File    │ Expected Bug │ Detected Bug │ Severity │ Spec Synthed │ Time  │
-├──────────────────┼──────────────┼──────────────┼──────────────┼──────────┼──────────────┼───────┤
-│ broken_promo     │ promo.diff   │     YES      │     YES      │ CRITICAL │  ✅ .spec.ts │ 0.02s │
-│ hidden_checkout  │ css.diff     │     YES      │     YES      │ HIGH     │  ✅ .spec.ts │ 0.00s │
-│ negative_cart    │ cart.diff    │     YES      │     YES      │ CRITICAL │  ✅ .spec.ts │ 0.00s │
-│ silent_checkout  │ checkout.diff│     YES      │     YES      │ HIGH     │  ✅ .spec.ts │ 0.00s │
-│ wrong_total      │ total.diff   │     YES      │     YES      │ HIGH     │  ✅ .spec.ts │ 0.00s │
-└──────────────────┴──────────────┴──────────────┴──────────────┴──────────┴──────────────┴───────┘
+Scenario                       Expected  Detected
+baseline_clean                 clean     NO
+broken_promo_uncaught_error    bug       YES   (uncaught TypeError on "Apply")
+hidden_checkout_css            bug       NO
+negative_cart_qty              bug       NO
+silent_checkout_failure        bug       NO
+wrong_total_calculation        bug       NO
 
-Summary Metrics:
-• Total Seeded Bug Scenarios: 5
-• Regressions Caught (Recall): 100.0%
-• Playwright Specs Generated: 5/5 (100.0%)
-• Avg Detection Latency: 0.01s
+Recall: 1/5 seeded regressions caught
+False positives: 0/1 clean runs flagged
 ```
+
+The mock can only see hard failures. The other four scenarios are invariant bugs (wrong totals, negative quantities, a hidden button, a missing confirmation): catching them requires a real model, which receives the page's final visible text alongside the flow's invariants. Run `diffqa eval --provider meta` (or another provider) to measure that.
 
 ---
 
@@ -247,27 +239,24 @@ When DiffQA catches a regression during PR inspection, it immediately generates 
 import { test, expect } from '@playwright/test';
 
 /**
- * 🤖 DiffQA Auto-Generated Regression Test
- * Flow: Decrement item quantity below zero
- * Bug: Cart quantity decrements to negative value; subtotal displays negative balance
- * Severity: CRITICAL
- * Root Cause Hypothesis: The refactored changeQuantity() removed the qty <= 0 guard.
+ * DiffQA auto-generated regression test
+ * Flow: Click through every visible control
+ * Bug: Errors observed during flow execution
+ * Severity: HIGH
  */
-test.describe('DiffQA Regressions: flow-cart-negative-boundary', () => {
-  test('reproduce: Cart quantity decrements to negative value', async ({ page }) => {
-    // 1. Initial Navigation
-    await page.goto('http://localhost:3000/cart');
+test.describe("DiffQA Regressions: flow-smoke-click-through", () => {
+  test("reproduce: Errors observed during flow execution", async ({ page }) => {
+    await page.goto("http://127.0.0.1:3000/");
 
-    // 2. Playwright Step Replay
-    await page.locator(`#btn-add-to-cart-1`).click();
+    // Step 1: Clicking unexplored button [btn-add-to-cart-1].
+    await page.locator("#btn-add-to-cart-1").click();
     await page.waitForTimeout(300);
 
-    await page.locator(`#btn-qty-decrement-1`).click();
+    // Step 5: Clicking unexplored button [btn-apply-promo].
+    await page.locator("#btn-apply-promo").click();
     await page.waitForTimeout(300);
 
-    // 3. Regression Assertions
-    // Invariant: Item quantity >= 0 at all times
-    // Invariant: Cart total is always non-negative
+    // Invariant: No uncaught JavaScript exceptions
     await expect(page.locator('body')).not.toContainText('Internal Server Error');
   });
 });
@@ -277,8 +266,22 @@ test.describe('DiffQA Regressions: flow-cart-negative-boundary', () => {
 
 ## 🤖 Meta Models Integration
 
-| Pipeline Stage | Meta Model | Role |
-| :--- | :--- | :--- |
+DiffQA calls the [Meta Model API](https://dev.meta.ai/docs) (`https://api.meta.ai/v1/chat/completions`, OpenAI-compatible) with your `MODEL_API_KEY`.
+
+| Pipeline Stage | Default model | Setting | Role |
+| :--- | :--- | :--- | :--- |
+| **Flow Planner** | `muse-spark-1.3` | `DIFFQA_CODE_MODEL` | Reads the diff and designs happy-path and adversarial journeys with invariants. |
+| **Browser Agent** | `muse-spark-1.3` | `DIFFQA_AGENT_MODEL` | Picks each next action from the live page's interactive elements. |
+| **Regression Judge** | `muse-spark-1.3` | `DIFFQA_JUDGE_MODEL` | Checks invariants against the final page text, errors and network failures. |
+
+Other OpenAI-compatible hosts (Fireworks, Baseten, Modal serving Muse Spark Open) and local Ollama work via `--provider`; set the three model variables to that host's model IDs.
+
+**Reliability:** rate limits (429), 5xx and network errors are retried with exponential backoff; a reply that isn't JSON gets one repair request; loosely formatted model output (`"severity": "high"`, `"action": "type"`) is normalised rather than rejected. If DiffQA can't test a flow (preview unreachable, model down) the flow is reported as **Not tested**, never as an app bug, and the run still fails so CI stays red.
+
+### CI setup
+Add the repository secret `MODEL_API_KEY` and the variable `DIFFQA_PREVIEW_URL` (your PR preview deployment). [`.github/workflows/diffqa.yml`](.github/workflows/diffqa.yml) then runs on every PR, comments the report, uploads screenshots/specs, and fails the check on regressions.
+
+--- | :--- | :--- |
 | **Diff & AST Analysis** | `meta/muse-code` / `Llama-3.3-70B` | Reads code diffs, identifies modified endpoints/components, and designs happy/adversarial test journeys. |
 | **Browser Exploration Agent** | `meta/muse-spark` / `Llama-3.2-Vision` | Closed action-perception loop driving Playwright via structured DOM observation. |
 | **Regression Judge / Oracle** | `meta/muse-wonder` / `Llama-3.2-Vision` | Multi-signal evaluation: DOM invariants, visual layout breakage, uncaught exceptions, and 500 status codes. |

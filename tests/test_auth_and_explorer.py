@@ -1,7 +1,6 @@
 """Tests for AuthManager and SiteExplorer."""
 
 import pytest
-from pathlib import Path
 from diffqa.agent.auth import AuthManager
 from diffqa.config import Settings
 from diffqa.llm.client import LLMClient

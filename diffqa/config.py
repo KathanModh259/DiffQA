@@ -8,7 +8,7 @@ mock provider for offline development and testing.
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,34 +21,44 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # Fields list their own name first in AliasChoices so Settings(provider=...) beats .env;
+    # with a plain alias the .env value silently won and every CLI --provider flag was ignored.
+
     # ── Provider Selection ──────────────────────────────────────────────
     provider: Literal["meta", "fireworks", "baseten", "modal", "ollama", "mock"] = Field(
         default="meta",
-        alias="DIFFQA_PROVIDER",
+        validation_alias=AliasChoices("provider", "DIFFQA_PROVIDER"),
         description="Inference provider to use for LLM completions.",
     )
 
     # ── API Keys ────────────────────────────────────────────────────────
-    meta_api_key: Optional[str] = Field(default=None, alias="META_API_KEY")
-    meta_api_base: str = Field(default="https://api.meta.com/v1", alias="META_API_BASE")
-    fireworks_api_key: Optional[str] = Field(default=None, alias="FIREWORKS_API_KEY")
-    baseten_api_key: Optional[str] = Field(default=None, alias="BASETEN_API_KEY")
-    modal_api_key: Optional[str] = Field(default=None, alias="MODAL_API_KEY")
+    # Meta's docs call the key MODEL_API_KEY; META_API_KEY is accepted too.
+    meta_api_key: Optional[str] = Field(
+        default=None, validation_alias=AliasChoices("meta_api_key", "META_API_KEY", "MODEL_API_KEY")
+    )
+    meta_api_base: str = Field(default="https://api.meta.ai/v1", validation_alias=AliasChoices("meta_api_base", "META_API_BASE"))
+    fireworks_api_key: Optional[str] = Field(default=None, validation_alias=AliasChoices("fireworks_api_key", "FIREWORKS_API_KEY"))
+    baseten_api_key: Optional[str] = Field(default=None, validation_alias=AliasChoices("baseten_api_key", "BASETEN_API_KEY"))
+    modal_api_key: Optional[str] = Field(default=None, validation_alias=AliasChoices("modal_api_key", "MODAL_API_KEY"))
+    modal_api_base: Optional[str] = Field(default=None, validation_alias=AliasChoices("modal_api_base", "MODAL_API_BASE"))
+    ollama_api_base: str = Field(
+        default="http://localhost:11434/api/chat", validation_alias=AliasChoices("ollama_api_base", "OLLAMA_API_BASE")
+    )
 
     # ── Model Identifiers ──────────────────────────────────────────────
     code_model: str = Field(
-        default="meta/muse-code",
-        alias="DIFFQA_CODE_MODEL",
+        default="muse-spark-1.3",
+        validation_alias=AliasChoices("code_model", "DIFFQA_CODE_MODEL"),
         description="Model for diff analysis and flow planning.",
     )
     agent_model: str = Field(
-        default="meta/muse-spark",
-        alias="DIFFQA_AGENT_MODEL",
+        default="muse-spark-1.3",
+        validation_alias=AliasChoices("agent_model", "DIFFQA_AGENT_MODEL"),
         description="Model for autonomous browser agent action selection.",
     )
     judge_model: str = Field(
-        default="meta/muse-wonder",
-        alias="DIFFQA_JUDGE_MODEL",
+        default="muse-spark-1.3",
+        validation_alias=AliasChoices("judge_model", "DIFFQA_JUDGE_MODEL"),
         description="Model for regression oracle verdicts.",
     )
 

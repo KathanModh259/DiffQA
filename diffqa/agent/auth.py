@@ -2,25 +2,17 @@
 
 import asyncio
 import logging
-import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 from rich.console import Console
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
-
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+from playwright.async_api import Page
 
 from diffqa.agent.browser import BrowserController
 
 logger = logging.getLogger("diffqa.auth")
 console = Console()
 
-LOGIN_DETECTION_SCRIPT = """
+LOGIN_DETECTION_SCRIPT = r"""
 () => {
     const hasPasswordField = !!document.querySelector('input[type="password"]');
     const hasLoginKeywordInUrl = /login|signin|auth|session|sign-in/i.test(window.location.href);
@@ -30,15 +22,17 @@ LOGIN_DETECTION_SCRIPT = """
     // Locate candidate username/email and password fields
     const userField = document.querySelector('input[type="email"], input[type="text"][name*="user"], input[type="text"][name*="email"], input[name="username"], input[id*="user"], input[id*="email"]');
     const passField = document.querySelector('input[type="password"]');
-    const submitBtn = document.querySelector('button[type="submit"], input[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Login")');
+    const submitBtn = document.querySelector('button[type="submit"], input[type="submit"]') ||
+        Array.from(document.querySelectorAll('button')).find(b => /^\s*(sign in|log in|login)\s*$/i.test(b.innerText));
+    const cssFor = (el, fallback) => el.id ? `#${CSS.escape(el.id)}` : (el.name ? `[name="${CSS.escape(el.name)}"]` : fallback);
 
     return {
         is_login_page: hasPasswordField || (hasLoginKeywordInUrl && hasLoginForm),
         has_password_field: hasPasswordField,
         has_user_field: !!userField,
-        user_selector: userField ? (userField.id ? `#${userField.id}` : `input[name="${userField.name}"]`) : null,
-        pass_selector: passField ? (passField.id ? `#${passField.id}` : 'input[type="password"]') : null,
-        submit_selector: submitBtn ? (submitBtn.id ? `#${submitBtn.id}` : 'button[type="submit"]') : null,
+        user_selector: userField ? cssFor(userField, 'input[type="email"]') : null,
+        pass_selector: passField ? cssFor(passField, 'input[type="password"]') : null,
+        submit_selector: submitBtn ? cssFor(submitBtn, 'button[type="submit"]') : null,
         current_url: window.location.href
     };
 }
@@ -72,13 +66,13 @@ class AuthManager:
         wait_interactive: bool = True,
         max_wait_seconds: int = 120,
     ) -> bool:
-        """Execute automated login or wait interactively for human login, then persist session state."""
+        """Log in automatically or wait for a human; return True only if a login actually completed."""
         page = controller.page
         status = await self.check_login_required(page)
 
-        if not status.get("is_login_page") and not status.get("has_password_field"):
+        if not status.get("is_login_page"):
             logger.info("No login barrier detected on the page. Proceeding.")
-            return True
+            return False
 
         console.print(f"\n[bold yellow][Auth] Login Page Detected:[/bold yellow] [cyan]{page.url}[/cyan]")
 
@@ -117,8 +111,7 @@ class AuthManager:
                 "│ [bold cyan]>> INTERACTIVE LOGIN REQUIRED[/bold cyan]                                            │\n"
                 "│ Please log in to the web application in the open browser window.       │\n"
                 "│ (SSO, Google, MFA, CAPTCHA, or custom credentials are all supported).   │\n"
-                "│ DiffQA will automatically detect login completion, or you can press    │\n"
-                "│ [bold yellow]Enter[/bold yellow] in this terminal when finished.                                  │\n"
+                f"│ DiffQA detects completion automatically (timeout: {max_wait_seconds:>3}s).             │\n"
                 "└────────────────────────────────────────────────────────────────────────┘\n"
             )
 
@@ -137,9 +130,8 @@ class AuthManager:
                 except Exception:
                     pass
 
-            console.print("[bold green]Resuming DiffQA agent...[/bold green]")
-            await self.save_storage_state(controller)
-            return True
+            # Don't cache a logged-out session: it would be silently reused on every later run.
+            console.print("[bold red][Auth] Login not detected before timeout; continuing unauthenticated.[/bold red]")
 
         return False
 

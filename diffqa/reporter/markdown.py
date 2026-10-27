@@ -2,10 +2,10 @@
 
 from pathlib import Path
 from typing import List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from diffqa.analyzer.flow_planner import TestFlowPlan
-from diffqa.judge.oracle import JudgeVerdict, BugSeverity
+from diffqa.judge.oracle import JudgeVerdict
 
 
 class FlowReportItem(BaseModel):
@@ -16,7 +16,6 @@ class FlowReportItem(BaseModel):
     passed: bool
     verdict: JudgeVerdict
     spec_code_ts: Optional[str] = None
-    spec_code_py: Optional[str] = None
     duration_seconds: float = 0.0
 
 
@@ -30,9 +29,9 @@ class PRReportGenerator:
         preview_url: str = "",
         commit_sha: Optional[str] = None,
     ) -> str:
-        passed_count = sum(1 for item in items if item.passed)
+        sum(1 for item in items if item.passed)
         failed_count = sum(1 for item in items if not item.passed)
-        total_count = len(items)
+        len(items)
 
         status_badge = (
             "![Status](https://img.shields.io/badge/DiffQA-PASSED-brightgreen)"
@@ -52,7 +51,7 @@ class PRReportGenerator:
         md.append("| Status | Flow | Route | Type | Duration |")
         md.append("| :---: | :--- | :--- | :---: | :---: |")
         for item in items:
-            badge = "✅ Pass" if item.passed else "❌ Fail"
+            badge = "✅ Pass" if item.passed else ("⚠️ Not tested" if item.verdict.verdict == "ERROR" else "❌ Fail")
             type_badge = f"`{item.flow_type}`"
             md.append(f"| {badge} | **{item.title}** | `{item.route}` | {type_badge} | {item.duration_seconds:.1f}s |")
         md.append("\n---\n")
@@ -65,7 +64,6 @@ class PRReportGenerator:
                     continue
 
                 v = item.verdict
-                severity_color = "red" if v.severity == BugSeverity.CRITICAL else "orange"
                 severity_tag = f"**Severity: `{v.severity.value if v.severity else 'HIGH'}`**"
 
                 md.append(f"#### ❌ {v.title or item.title}")

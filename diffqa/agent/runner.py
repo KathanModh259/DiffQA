@@ -3,10 +3,11 @@
 import logging
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
-from diffqa.agent.actions import ActionType, AgentAction, ExecutionStep
+from diffqa.agent.actions import AgentAction, ExecutionStep
 from diffqa.agent.browser import BrowserController
 from diffqa.agent.dom_observer import DOMObserver
 from diffqa.analyzer.flow_planner import UserFlow
@@ -25,6 +26,21 @@ class FlowRunResult(BaseModel):
     all_screenshots: List[str] = Field(default_factory=list)
     uncaught_errors: List[str] = Field(default_factory=list)
     network_failures: List[Dict[str, Any]] = Field(default_factory=list)
+    final_page_text: str = ""
+    # Set when DiffQA itself couldn't test (site unreachable, model down): not evidence of an app bug.
+    infra_error: Optional[str] = None
+
+
+MAX_PAGE_TEXT_CHARS = 4000
+MAX_PROMPT_ELEMENTS = 80
+MAX_LLM_FAILURES = 3
+
+
+def flow_url(base_url: str, route: str) -> str:
+    """Join a planned route onto the base URL; absolute routes are honoured only on the same host."""
+    if urlparse(route).scheme:
+        return route if urlparse(route).netloc == urlparse(base_url).netloc else base_url
+    return f"{base_url.rstrip('/')}/{route.lstrip('/')}"
 
 
 SYSTEM_AGENT_PROMPT = """You are DiffQA Browser Agent, an expert QA automation agent powered by Meta's Muse Spark.
@@ -86,7 +102,7 @@ class BrowserAgentRunner:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         start_time = time.time()
-        initial_url = f"{base_url.rstrip('/')}/{flow.route.lstrip('/')}"
+        initial_url = flow_url(base_url, flow.route)
         logger.info(f"Starting flow '{flow.title}' at {initial_url}")
 
         steps: List[ExecutionStep] = []
@@ -94,6 +110,7 @@ class BrowserAgentRunner:
         uncaught_errors: List[str] = []
         network_failures: List[Dict[str, Any]] = []
 
+        self.controller.drain_diagnostics()  # don't inherit errors from the previous flow
         try:
             await self.controller.navigate(initial_url)
         except Exception as e:
@@ -102,20 +119,22 @@ class BrowserAgentRunner:
                 flow=flow,
                 success=False,
                 duration_seconds=time.time() - start_time,
-                uncaught_errors=[f"Navigation error: {e}"],
+                infra_error=f"Could not load {initial_url}: {e}",
             )
 
         step_num = 0
         terminal_reached = False
+        llm_failures = 0
+        site_host = urlparse(initial_url).netloc
 
         while step_num < self.settings.max_steps_per_flow:
             step_num += 1
             step_start = time.time()
             url_before = self.controller.page.url
 
-            # 1. Observe current page interactive DOM
+            # 1. Observe current page interactive DOM (capped: real pages can have thousands of controls)
             elements = await self.dom.extract_interactive_elements(self.controller.page)
-            elements_text = self.dom.format_elements_for_prompt(elements)
+            elements_text = self.dom.format_elements_for_prompt(elements[:MAX_PROMPT_ELEMENTS])
 
             # Map diffqa_id -> selector for fast lookup
             elem_map = {el.diffqa_id: el.selector for el in elements}
@@ -130,7 +149,8 @@ class BrowserAgentRunner:
 
             # 3. Build prompt for Next Action
             history_text = "\n".join(
-                f"Step {s.step_number}: [{s.action.action.value}] target={s.action.target_id} value='{s.action.value}' (success={s.success})"
+                f"Step {s.step_number}: [{s.action.action.value}] target={s.action.target_id} value='{s.action.value}' "
+                f"(success={s.success}{', error=' + s.error_message[:150] if s.error_message else ''})"
                 for s in steps
             ) or "None (just landed on page)"
 
@@ -157,43 +177,46 @@ Choose the next action to advance this test."""
             try:
                 action_data = await self.llm.complete_json(messages, model=self.settings.agent_model)
                 action = AgentAction(**action_data)
+                llm_failures = 0
             except Exception as e:
-                logger.error(f"Failed to generate next action: {e}")
-                action = AgentAction(
-                    thought=f"Error generating action: {e}. Terminating flow.",
-                    action=ActionType.WAIT,
-                    is_terminal=True,
-                )
+                # One bad reply shouldn't end the flow; a persistently failing model should.
+                llm_failures += 1
+                logger.error(f"Failed to generate next action ({llm_failures}/{MAX_LLM_FAILURES}): {e}")
+                if llm_failures >= MAX_LLM_FAILURES:
+                    return FlowRunResult(
+                        flow=flow,
+                        steps=steps,
+                        success=False,
+                        duration_seconds=time.time() - start_time,
+                        all_screenshots=all_screenshots,
+                        uncaught_errors=uncaught_errors,
+                        network_failures=network_failures,
+                        infra_error=f"Agent model failed {llm_failures} times in a row: {e}",
+                    )
+                step_num -= 1
+                continue
 
             # 5. Execute Action
             exec_success = True
             error_msg = None
             try:
-                # If target_id is not on page, dynamically bind to an actual visible element
-                if action.target_id and action.target_id not in elem_map and elem_map:
-                    available_keys = [k for k in elem_map.keys() if k and elem_map[k]]
-                    if available_keys:
-                        if step_num > len(available_keys):
-                            action.thought = f"Explored all {len(available_keys)} visible controls. Completing flow."
-                            action.action = ActionType.WAIT
-                            action.value = "500"
-                            action.is_terminal = True
-                        else:
-                            picked_id = available_keys[step_num - 1]
-                            action.thought = f"Adapting to live page control [{picked_id}]."
-                            action.target_id = picked_id
-                            action.selector = elem_map[picked_id]
-
-                selector_fallback = elem_map.get(action.target_id) if action.target_id else None
-                if not action.selector and selector_fallback:
-                    action.selector = selector_fallback
-                elif not action.selector and action.target_id:
-                    action.selector = f"[data-diffqa-id='{action.target_id}']"
-                await self.controller.execute_action(action, selector_fallback=selector_fallback)
+                # A hallucinated target_id fails loudly; the error shows up in the next prompt's history.
+                if not action.selector and action.target_id:
+                    action.selector = elem_map.get(action.target_id) or f"[data-diffqa-id='{action.target_id}']"
+                await self.controller.execute_action(action)
             except Exception as e:
                 exec_success = False
-                error_msg = str(e)
-                logger.warning(f"Action execution failed on step {step_num}: {e}")
+                error_msg = str(e).split("\n")[0][:300]
+                logger.warning(f"Action execution failed on step {step_num}: {error_msg}")
+
+            # Keep the agent on the site under test (external links, OAuth popups in the main tab, ads).
+            if site_host and urlparse(self.controller.page.url).netloc not in (site_host, ""):
+                left_to = self.controller.page.url
+                try:
+                    await self.controller.navigate(url_before)
+                    action.thought += f" [DiffQA returned from external page {left_to}]"
+                except Exception as e:
+                    logger.warning(f"Could not return from external page {left_to}: {e}")
 
             # 6. Drain diagnostics (console and network errors)
             diag = self.controller.drain_diagnostics()
@@ -220,6 +243,11 @@ Choose the next action to advance this test."""
                 terminal_reached = True
                 break
 
+        try:
+            final_page_text = (await self.controller.page.inner_text("body"))[:MAX_PAGE_TEXT_CHARS]
+        except Exception:
+            final_page_text = ""
+
         duration = time.time() - start_time
         overall_success = (
             len(uncaught_errors) == 0
@@ -236,5 +264,6 @@ Choose the next action to advance this test."""
             all_screenshots=all_screenshots,
             uncaught_errors=uncaught_errors,
             network_failures=network_failures,
+            final_page_text=final_page_text,
         )
 

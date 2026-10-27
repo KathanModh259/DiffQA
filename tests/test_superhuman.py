@@ -1,7 +1,6 @@
 """Tests for Superhuman QA Oracle and issue reporting."""
 
-import pytest
-from diffqa.judge.superhuman import SuperhumanIssue, SuperhumanOracle, SuperhumanAuditReport
+from diffqa.judge.superhuman import SuperhumanIssue, SuperhumanAuditReport
 
 
 class TestSuperhumanOracle:

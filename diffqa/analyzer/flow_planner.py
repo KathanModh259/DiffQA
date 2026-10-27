@@ -9,9 +9,10 @@ configured model) to synthesize:
 
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+import re
+from typing import List, Literal, Optional, get_args
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from diffqa.analyzer.diff_parser import ParsedDiff
 from diffqa.llm.client import LLMClient, get_llm_client
@@ -20,16 +21,44 @@ from diffqa.llm.client import LLMClient, get_llm_client
 # ── Data Models ─────────────────────────────────────────────────────────────
 
 
+FlowType = Literal["happy_path", "adversarial", "visual_regression"]
+
+
 class UserFlow(BaseModel):
     """A single test scenario to execute in the browser."""
 
-    flow_id: str
-    title: str
+    flow_id: str = "flow"
+    title: str = "Untitled flow"
     route: str = "/"
-    flow_type: Literal["happy_path", "adversarial", "visual_regression"] = "happy_path"
-    goal: str
+    flow_type: FlowType = "happy_path"
+    goal: str = ""
     steps: List[str] = Field(default_factory=list)
     invariants: List[str] = Field(default_factory=list)
+
+    @field_validator("flow_id", mode="before")
+    @classmethod
+    def _safe_flow_id(cls, v: object) -> str:
+        # flow_id becomes a directory and file name, so keep it to a safe slug.
+        slug = re.sub(r"[^a-z0-9_-]+", "-", str(v or "flow").lower()).strip("-")
+        return slug[:60] or "flow"
+
+    @field_validator("flow_type", mode="before")
+    @classmethod
+    def _known_flow_type(cls, v: object) -> str:
+        v = str(v or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return v if v in get_args(FlowType) else "adversarial" if "advers" in v or "edge" in v else "happy_path"
+
+    @field_validator("route", mode="before")
+    @classmethod
+    def _route(cls, v: object) -> str:
+        return str(v or "/").strip() or "/"
+
+    @field_validator("steps", "invariants", mode="before")
+    @classmethod
+    def _str_list(cls, v: object) -> List[str]:
+        if v is None:
+            return []
+        return [str(x) for x in v] if isinstance(v, list) else [str(v)]
 
 
 class TestFlowPlan(BaseModel):
@@ -37,10 +66,21 @@ class TestFlowPlan(BaseModel):
 
     __test__ = False
 
-    summary: str
+    summary: str = ""
     affected_routes: List[str] = Field(default_factory=list)
-    risk_assessment: str
+    risk_assessment: str = ""
     flows: List[UserFlow] = Field(default_factory=list)
+
+    @field_validator("flows")
+    @classmethod
+    def _unique_ids(cls, flows: List[UserFlow]) -> List[UserFlow]:
+        seen: set[str] = set()
+        for f in flows:
+            base, n = f.flow_id, 2
+            while f.flow_id in seen:
+                f.flow_id, n = f"{base}-{n}", n + 1
+            seen.add(f.flow_id)
+        return flows
 
 
 # ── System Prompt ───────────────────────────────────────────────────────────
@@ -119,5 +159,25 @@ class FlowPlanner:
             {"role": "user", "content": user_prompt},
         ]
 
-        data = await self.llm.complete_json(messages)
-        return TestFlowPlan(**data)
+        return normalize_plan(await self.llm.complete_json(messages))
+
+
+MAX_FLOWS = 6
+
+SMOKE_FLOW = UserFlow(
+    flow_id="flow-smoke",
+    title="Smoke test: load page and exercise visible controls",
+    goal="The page loads and its main controls respond without runtime errors or server failures.",
+    steps=["Load the page", "Interact with the main visible controls"],
+    invariants=["No uncaught JavaScript exceptions", "No HTTP 5xx responses"],
+)
+
+
+def normalize_plan(data: dict) -> TestFlowPlan:
+    """Validate model output into a plan that is never empty and never unbounded.
+
+    An empty plan would yield an "all passed" report for a run that tested nothing.
+    """
+    plan = TestFlowPlan(**data)
+    plan.flows = plan.flows[:MAX_FLOWS] or [SMOKE_FLOW.model_copy()]
+    return plan
