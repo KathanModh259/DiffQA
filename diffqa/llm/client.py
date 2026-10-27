@@ -243,18 +243,17 @@ class LLMClient:
             })
 
         # Check if browser agent next action request
-        if "select next browser action" in prompt_text or "available interactive elements" in prompt_text:
-            # Check what state we are in from prompt
-            if "cart" in prompt_text and "decrement" in prompt_text:
+        if "select next browser action" in prompt_text or "available interactive elements" in prompt_text or "choose the next action" in prompt_text:
+            if "btn-qty-decrement" in prompt_text:
                 return json.dumps({
-                    "thought": "Found decrement button on cart page. Clicking decrement to test boundary condition.",
+                    "thought": "Found decrement button in cart. Clicking decrement to verify boundary behavior.",
                     "action": "click",
                     "target_id": "btn-qty-decrement",
                     "value": None,
-                    "is_terminal": False
+                    "is_terminal": True
                 })
             return json.dumps({
-                "thought": "Navigating to entry page and locating primary CTA.",
+                "thought": "Adding product to cart to initialize cart state.",
                 "action": "click",
                 "target_id": "btn-add-to-cart-1",
                 "value": None,

@@ -17,6 +17,11 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+# Ensure workspace root is in sys.path
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
 from diffqa.agent.browser import BrowserController
 from diffqa.agent.runner import BrowserAgentRunner
 from diffqa.analyzer.diff_parser import DiffParser
@@ -27,6 +32,7 @@ from diffqa.llm.client import LLMClient
 from diffqa.reporter.markdown import FlowReportItem, PRReportGenerator
 from diffqa.synthesizer.test_writer import PlaywrightTestSynthesizer
 from diffqa.benchmark import BenchmarkRunner
+from benchmarks.serve import run_server
 
 app = typer.Typer(
     name="diffqa",
@@ -187,6 +193,58 @@ def eval(
         results = asyncio.run(runner.run_benchmark())
 
     runner.print_scorecard(results)
+
+
+@app.command()
+def serve(
+    port: int = typer.Option(3000, "--port", "-p", help="Port to run the testbed web app on"),
+):
+    """Launch the local QuickShop testbed web application."""
+    console.print(Panel.fit(
+        f"[bold cyan]Launching DiffQA Testbed Web App[/bold cyan]\n"
+        f"URL: [green]http://localhost:{port}[/green]"
+    ))
+    run_server(port=port)
+
+
+@app.command()
+def demo(
+    port: int = typer.Option(3000, "--port", "-p", help="Port to run demo testbed on"),
+    provider: str = typer.Option("mock", "--provider", help="Model provider to use (default: mock for instant offline demo)"),
+    headless: bool = typer.Option(True, "--headless/--headed", help="Run browser in headless or headed mode"),
+):
+    """Run an automated end-to-end demo of DiffQA against a seeded buggy PR."""
+    import threading
+    import socketserver
+    from benchmarks.serve import Handler, DIRECTORY
+
+    console.print(Panel.fit(
+        "[bold cyan]DiffQA Live End-to-End Demo[/bold cyan]\n"
+        "[dim]Spinning up local testbed server and running autonomous browser testing against buggy PR diff...[/dim]"
+    ))
+
+    # 1. Start background testbed server
+    server = socketserver.TCPServer(("", port), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    console.print(f"⚡ Local testbed server active at [green]http://localhost:{port}[/green]")
+
+    try:
+        # 2. Run DiffQA pipeline against seeded regression diff
+        diff_path = Path("benchmarks/scenarios/negative_cart_qty.diff")
+        out_dir = Path("diffqa_output")
+
+        asyncio.run(_run_pipeline(
+            diff_path=diff_path,
+            url=f"http://localhost:{port}",
+            output_dir=out_dir,
+            provider=provider,
+            headless=headless,
+        ))
+    finally:
+        server.shutdown()
+        server.server_close()
+        console.print("[dim]Local testbed server stopped.[/dim]")
 
 
 if __name__ == "__main__":

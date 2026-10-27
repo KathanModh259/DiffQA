@@ -170,6 +170,10 @@ Choose the next action to advance this test."""
             error_msg = None
             try:
                 selector_fallback = elem_map.get(action.target_id) if action.target_id else None
+                if not action.selector and selector_fallback:
+                    action.selector = selector_fallback
+                elif not action.selector and action.target_id:
+                    action.selector = f"[data-diffqa-id='{action.target_id}']"
                 await self.controller.execute_action(action, selector_fallback=selector_fallback)
             except Exception as e:
                 exec_success = False

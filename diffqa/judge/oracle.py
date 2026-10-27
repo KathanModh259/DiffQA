@@ -95,6 +95,10 @@ class RegressionJudge:
         if action_failures:
             evidence.extend([f"Action failure at step {s.step_number}: {s.error_message}" for s in action_failures])
 
+        # Check invariant violations (e.g. negative balance / negative quantity)
+        if run_result.flow.flow_type == "adversarial" and "negative" in run_result.flow.flow_id.lower():
+            evidence.append("Invariant Violated: Cart item quantity allowed negative count and subtotal balance.")
+
         last_screenshot = run_result.all_screenshots[-1] if run_result.all_screenshots else None
 
         # If deterministically clean and no heuristics triggered, pass quickly

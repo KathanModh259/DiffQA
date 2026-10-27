@@ -25,15 +25,15 @@ test.describe('DiffQA Regressions: {{ flow_id }}', () => {
 {% for step in steps %}
     // Step {{ step.step_number }}: {{ step.thought }}
 {% if step.action == 'click' %}
-    await page.locator('{{ step.selector }}').click();
+    await page.locator(`{{ step.selector }}`).click();
 {% elif step.action == 'fill' %}
-    await page.locator('{{ step.selector }}').fill('{{ step.value }}');
+    await page.locator(`{{ step.selector }}`).fill(`{{ step.value }}`);
 {% elif step.action == 'navigate' %}
-    await page.goto('{{ step.value }}');
+    await page.goto(`{{ step.value }}`);
 {% elif step.action == 'scroll' %}
     await page.evaluate(() => window.scrollBy(0, {{ step.value or 400 }}));
 {% elif step.action == 'press' %}
-    await page.keyboard.press('{{ step.value or "Enter" }}');
+    await page.keyboard.press(`{{ step.value or "Enter" }}`);
 {% elif step.action == 'wait' %}
     await page.waitForTimeout({{ step.value or 1000 }});
 {% endif %}
@@ -70,15 +70,15 @@ async def test_repro_{{ flow_id_slug }}(page: Page):
 {% for step in steps %}
     # Step {{ step.step_number }}: {{ step.thought }}
 {% if step.action == 'click' %}
-    await page.locator("{{ step.selector }}").click()
+    await page.locator("""{{ step.selector }}""").click()
 {% elif step.action == 'fill' %}
-    await page.locator("{{ step.selector }}").fill("{{ step.value }}")
+    await page.locator("""{{ step.selector }}""").fill("""{{ step.value }}""")
 {% elif step.action == 'navigate' %}
-    await page.goto("{{ step.value }}")
+    await page.goto("""{{ step.value }}""")
 {% elif step.action == 'scroll' %}
     await page.evaluate("window.scrollBy(0, {{ step.value or 400 }})")
 {% elif step.action == 'press' %}
-    await page.keyboard.press("{{ step.value or 'Enter' }}")
+    await page.keyboard.press("""{{ step.value or 'Enter' }}""")
 {% elif step.action == 'wait' %}
     await page.wait_for_timeout({{ step.value or 1000 }})
 {% endif %}

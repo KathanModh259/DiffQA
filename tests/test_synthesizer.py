@@ -48,7 +48,7 @@ def test_synthesize_typescript_spec():
 
     assert "import { test, expect } from '@playwright/test';" in spec_code
     assert "reproduce: Cart quantity becomes negative on decrement" in spec_code
-    assert "page.locator('#btn-add-to-cart-1').click()" in spec_code
-    assert "page.locator('#btn-qty-decrement-1').click()" in spec_code
+    assert "page.locator(`#btn-add-to-cart-1`).click()" in spec_code
+    assert "page.locator(`#btn-qty-decrement-1`).click()" in spec_code
     assert "Quantity >= 0" in spec_code
 
