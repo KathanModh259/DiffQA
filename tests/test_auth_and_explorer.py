@@ -39,3 +39,4 @@ class TestSiteExplorerPlanning:
         assert plan.summary != ""
         assert len(plan.flows) >= 1
         assert any(f.flow_type in ("happy_path", "adversarial") for f in plan.flows)
+

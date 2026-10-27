@@ -25,11 +25,13 @@ if str(WORKSPACE_ROOT) not in sys.path:
 from diffqa.agent.browser import BrowserController
 from diffqa.agent.runner import BrowserAgentRunner
 from diffqa.analyzer.diff_parser import DiffParser
-from diffqa.analyzer.flow_planner import FlowPlanner
+from diffqa.analyzer.flow_planner import FlowPlanner, TestFlowPlan
 from diffqa.config import Settings
 from diffqa.judge.oracle import RegressionJudge
 from diffqa.llm.client import LLMClient
 from diffqa.reporter.markdown import FlowReportItem, PRReportGenerator
+from diffqa.reporter.dashboard import DashboardGenerator
+from diffqa.judge.superhuman import SuperhumanOracle
 from diffqa.synthesizer.test_writer import PlaywrightTestSynthesizer
 from diffqa.benchmark import BenchmarkRunner
 from benchmarks.serve import run_server
@@ -172,7 +174,13 @@ async def _run_pipeline(diff_path: Path, url: str, output_dir: Path, provider: s
     report_path = output_dir / "DIFFQA_REPORT.md"
     reporter.save_report(report_md, report_path)
 
-    console.print(f"\n📄 Saved PR Report: [bold cyan]{report_path}[/bold cyan]")
+    dashboard = DashboardGenerator()
+    dash_html = dashboard.generate_html(plan, report_items, preview_url=url)
+    dash_path = output_dir / "DIFFQA_DASHBOARD.html"
+    dashboard.save_dashboard(dash_html, dash_path)
+
+    console.print(f"\n[Report] Saved PR Report: [bold cyan]{report_path}[/bold cyan]")
+    console.print(f"[Report] Saved Interactive Dashboard: [bold yellow]{dash_path}[/bold yellow]")
     console.print("\n" + "=" * 60 + "\n")
     console.print(report_md)
 
@@ -280,6 +288,65 @@ def explore(
         wait_for_login=wait_for_login,
         custom_goal=goal,
     ))
+
+
+@app.command()
+def audit(
+    url: str = typer.Argument(..., help="Website URL to audit for superhuman invariants (e.g. https://example.com)"),
+    output: Path = typer.Option(Path("./diffqa_output"), "--output", "-o", help="Directory for reports and dashboard"),
+    headless: bool = typer.Option(True, "--headless/--headed", help="Run browser in headless or headed mode"),
+):
+    """Run an instant Superhuman Invariant Audit (visual shifts, a11y, broken assets, network/console issues)."""
+    asyncio.run(_run_audit(url, output, headless))
+
+
+async def _run_audit(url: str, output_dir: Path, headless: bool):
+    settings = Settings(headless=headless, output_dir=output_dir)
+    controller = BrowserController(settings=settings)
+    oracle = SuperhumanOracle()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    console.print(Panel.fit(
+        f"[bold cyan]DiffQA Superhuman Invariant Audit[/bold cyan]\n"
+        f"Auditing: [green]{url}[/green] for hidden layout, a11y, asset, and network bugs..."
+    ))
+
+    await controller.start()
+    try:
+        await controller.navigate(url)
+        report = await oracle.audit_page(
+            controller.page,
+            network_errors=controller.network_errors,
+            console_errors=[log["text"] for log in controller.console_logs if log["type"] == "error"],
+        )
+
+        table = Table(title=f"Superhuman Audit Scorecard ({report.quality_score}/100)")
+        table.add_column("Severity", style="bold")
+        table.add_column("Category", style="cyan")
+        table.add_column("Message", style="white")
+        table.add_column("Selector", style="yellow")
+
+        for issue in report.issues:
+            sev_color = "red" if issue.severity in ("CRITICAL", "HIGH") else "yellow"
+            table.add_row(
+                f"[{sev_color}]{issue.severity}[/{sev_color}]",
+                issue.category,
+                issue.message[:80],
+                issue.selector or "-",
+            )
+        console.print(table)
+        console.print(f"\n[bold]Summary:[/bold] Quality Score: [bold magenta]{report.quality_score}/100[/bold magenta] | Total Issues: [bold]{report.total_issues}[/bold]")
+
+        # Generate HTML dashboard
+        dashboard = DashboardGenerator()
+        plan = TestFlowPlan(summary=f"Superhuman Audit of {url}", affected_routes=["/"], risk_assessment="Audit", flows=[])
+        dash_html = dashboard.generate_html(plan, [], preview_url=url, audit=report)
+        dash_file = output_dir / "DIFFQA_AUDIT_DASHBOARD.html"
+        dashboard.save_dashboard(dash_html, dash_file)
+        console.print(f"Interactive Audit Dashboard: [bold yellow]{dash_file}[/bold yellow]")
+
+    finally:
+        await controller.close()
 
 
 if __name__ == "__main__":

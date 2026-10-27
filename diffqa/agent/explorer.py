@@ -27,6 +27,8 @@ from diffqa.config import Settings, get_settings
 from diffqa.judge.oracle import BugSeverity, JudgeVerdict, RegressionJudge
 from diffqa.llm.client import LLMClient, get_llm_client
 from diffqa.reporter.markdown import FlowReportItem, PRReportGenerator
+from diffqa.reporter.dashboard import DashboardGenerator
+from diffqa.judge.superhuman import SuperhumanOracle
 from diffqa.synthesizer.test_writer import PlaywrightTestSynthesizer
 
 logger = logging.getLogger("diffqa.explorer")
@@ -82,6 +84,8 @@ class SiteExplorer:
         self.dom = DOMObserver()
         self.synthesizer = PlaywrightTestSynthesizer()
         self.reporter = PRReportGenerator()
+        self.dashboard = DashboardGenerator()
+        self.superhuman = SuperhumanOracle()
 
     async def explore(
         self,
@@ -187,12 +191,22 @@ class SiteExplorer:
                     duration_seconds=run_result.duration_seconds,
                 ))
 
-            # 6. Generate and save QA Audit Report
+            # 6. Run Superhuman Invariant Audit
+            audit_report = await self.superhuman.audit_page(
+                controller.page,
+                network_errors=controller.network_errors,
+                console_errors=[log["text"] for log in controller.console_logs if log["type"] == "error"],
+            )
             report_md = self.reporter.generate_report(plan, report_items, preview_url=target_url)
             report_file = out_path / "DIFFQA_EXPLORER_REPORT.md"
             self.reporter.save_report(report_md, report_file)
 
-            console.print(f"\n📄 Saved Autonomous QA Report: [bold cyan]{report_file}[/bold cyan]")
+            dashboard_html = self.dashboard.generate_html(plan, report_items, preview_url=target_url, audit=audit_report)
+            dashboard_file = out_path / "DIFFQA_DASHBOARD.html"
+            self.dashboard.save_dashboard(dashboard_html, dashboard_file)
+            console.print(f"  Interactive Dashboard: [bold yellow]{dashboard_file}[/bold yellow]")
+
+            console.print(f"\n[Report] Saved Autonomous QA Report: [bold cyan]{report_file}[/bold cyan]")
             console.print("\n" + "=" * 60 + "\n")
             console.print(report_md)
             return report_file

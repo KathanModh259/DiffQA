@@ -6,7 +6,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Playwright](https://img.shields.io/badge/Playwright-Automated_Browser-45ba4b.svg?logo=playwright&logoColor=white)](https://playwright.dev/)
-[![Tests: 51 Passing](https://img.shields.io/badge/Tests-51%20Passing-brightgreen.svg)](tests/)
+[![Tests: 57 Passing](https://img.shields.io/badge/Tests-57%20Passing-brightgreen.svg)](tests/)
+[![Docker: Ready](https://img.shields.io/badge/Docker-Ready-2496ED.svg?logo=docker&logoColor=white)](Dockerfile)
 [![Powered by: Meta Model API](https://img.shields.io/badge/Powered%20by-Meta%20Model%20API-0081FB.svg?logo=meta&logoColor=white)](https://about.meta.com/)
 
 ---
@@ -179,7 +180,8 @@ DIFFQA_PROVIDER=mock
 | `diffqa scan --diff <file>` | Parses diff and previews planned flows without opening browser. |
 | `diffqa run --diff <file> --url <url>` | Runs autonomous QA on any custom PR diff and preview URL. |
 | `diffqa serve --port 3000` | Starts the QuickShop testbed web application locally. |
-| `pytest` | Runs the 51-test automated test suite. |
+| `diffqa audit <url>` | **Superhuman Invariant Audit**: catches layout overflow, text clipping, broken assets, WCAG a11y violations, and network errors. Generates interactive HTML dashboard. |
+| `pytest` | Runs the 57-test automated test suite. |
 
 ---
 
