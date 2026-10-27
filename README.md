@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Playwright](https://img.shields.io/badge/Playwright-Automated_Browser-45ba4b.svg?logo=playwright&logoColor=white)](https://playwright.dev/)
-[![Tests: 48 Passing](https://img.shields.io/badge/Tests-48%20Passing-brightgreen.svg)](tests/)
+[![Tests: 51 Passing](https://img.shields.io/badge/Tests-51%20Passing-brightgreen.svg)](tests/)
 [![Powered by: Meta Model API](https://img.shields.io/badge/Powered%20by-Meta%20Model%20API-0081FB.svg?logo=meta&logoColor=white)](https://about.meta.com/)
 
 ---
@@ -170,13 +170,40 @@ DIFFQA_PROVIDER=mock
 
 | Command | Description |
 | :--- | :--- |
+| `diffqa explore <url>` | **Test ANY website autonomously**: navigates to the URL, handles login/SSO barriers (interactive or automated), explores workflows, and synthesizes Playwright tests for bugs found. |
+| `diffqa explore <url> --headed` | Runs autonomous exploration with browser window visible. |
+| `diffqa explore <url> -u <email> -p <pass>` | Automated login using provided credentials before exploring. |
 | `diffqa demo` | **Full end-to-end demo**: spins up local testbed app, executes browser agent, catches bug, synthesizes Playwright test, and generates PR comment. |
 | `diffqa demo --headed` | Runs demo with browser window visibly open on screen. |
 | `diffqa eval` | Runs the quantitative evaluation benchmark across all seeded PR bug scenarios. |
 | `diffqa scan --diff <file>` | Parses diff and previews planned flows without opening browser. |
 | `diffqa run --diff <file> --url <url>` | Runs autonomous QA on any custom PR diff and preview URL. |
 | `diffqa serve --port 3000` | Starts the QuickShop testbed web application locally. |
-| `pytest` | Runs the 48-test automated test suite. |
+| `pytest` | Runs the 51-test automated test suite. |
+
+---
+
+## 🌐 Autonomous Exploration on ANY Website (`diffqa explore`)
+
+DiffQA is not limited to git diffs — it can test **any live web application**:
+
+```bash
+# 1. Test any public or staging URL:
+diffqa explore https://my-app.com --headed
+
+# 2. Test sites with Login / Auth:
+# If a login wall is detected, DiffQA opens the browser, pauses, and prompts:
+# "Please log in to the web application in the open browser window..."
+# Once you log in (via Google, SSO, MFA, or password), DiffQA saves your session
+# to `.diffqa_auth.json` and begins autonomous exploratory testing!
+diffqa explore https://app.example.com --headed
+
+# 3. Subsequent runs reuse your authenticated session automatically:
+diffqa explore https://app.example.com --auth-file .diffqa_auth.json
+
+# 4. Or pass credentials directly for hands-free automated login:
+diffqa explore https://app.example.com -u "admin@example.com" -p "Secret123!"
+```
 
 ---
 

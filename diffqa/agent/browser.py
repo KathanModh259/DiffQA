@@ -26,21 +26,34 @@ class BrowserController:
         self.network_errors: List[Dict[str, Any]] = []
         self.page_errors: List[str] = []
 
-    async def start(self) -> None:
-        """Initialize the Playwright engine and launch browser."""
+    async def start(self, storage_state_path: Optional[Path | str] = None) -> None:
+        """Initialize the Playwright engine and launch browser, optionally loading cached session cookies."""
         self._playwright = await async_playwright().start()
         browser_type = getattr(self._playwright, self.settings.browser_type)
         self._browser = await browser_type.launch(
             headless=self.settings.headless,
         )
-        self._context = await self._browser.new_context(
-            viewport={
+        context_kwargs: Dict[str, Any] = {
+            "viewport": {
                 "width": self.settings.viewport_width,
                 "height": self.settings.viewport_height,
             }
-        )
+        }
+        if storage_state_path and Path(storage_state_path).exists():
+            context_kwargs["storage_state"] = str(storage_state_path)
+            logger.info(f"Loaded cached browser authentication state from {storage_state_path}")
+
+        self._context = await self._browser.new_context(**context_kwargs)
         self._page = await self._context.new_page()
         self._attach_listeners()
+
+    async def save_storage_state(self, path: Path | str) -> None:
+        """Save browser session cookies and localStorage to disk."""
+        if not self._context:
+            raise RuntimeError("Browser context not started.")
+        save_path = Path(path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        await self._context.storage_state(path=str(save_path))
 
     def _attach_listeners(self) -> None:
         """Attach listeners for console errors, page errors, and network issues."""

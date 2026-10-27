@@ -202,8 +202,8 @@ class LLMClient:
         """
         prompt_text = " ".join(str(m.get("content", "")) for m in messages).lower()
 
-        # ── Flow Planner mock ──────────────────────────────────────────
-        if any(kw in prompt_text for kw in ("flow planner", "test flows", "affected routes", "plan user flows", "map out")):
+        # ── Flow Planner & Site Explorer mock ──────────────────────────
+        if any(kw in prompt_text for kw in ("flow planner", "test flows", "affected routes", "plan user flows", "map out", "site explorer", "exploratory user journeys")):
             return json.dumps({
                 "summary": "PR modifies cart state management — quantity updates, item removal, and subtotal calculation logic.",
                 "affected_routes": ["/", "/cart", "/checkout"],

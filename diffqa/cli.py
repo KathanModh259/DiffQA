@@ -33,6 +33,7 @@ from diffqa.reporter.markdown import FlowReportItem, PRReportGenerator
 from diffqa.synthesizer.test_writer import PlaywrightTestSynthesizer
 from diffqa.benchmark import BenchmarkRunner
 from benchmarks.serve import run_server
+from diffqa.agent.explorer import SiteExplorer
 
 app = typer.Typer(
     name="diffqa",
@@ -245,6 +246,40 @@ def demo(
         server.shutdown()
         server.server_close()
         console.print("[dim]Local testbed server stopped.[/dim]")
+
+
+@app.command()
+def explore(
+    url: str = typer.Argument(..., help="Target website URL to test (e.g. https://example.com)"),
+    output: Path = typer.Option(Path("./diffqa_output"), "--output", "-o", help="Directory for reports and specs"),
+    provider: str = typer.Option("meta", "--provider", "-p", help="Model provider (meta, fireworks, baseten, modal, mock)"),
+    headless: bool = typer.Option(False, "--headless/--headed", help="Run browser in headless or headed mode (headed recommended for login)"),
+    wait_for_login: bool = typer.Option(True, "--login/--no-login", help="Detect login page and wait for user authentication if needed"),
+    user: Optional[str] = typer.Option(None, "--user", "-u", help="Username or email for automated login"),
+    password: Optional[str] = typer.Option(None, "--password", help="Password for automated login"),
+    goal: Optional[str] = typer.Option(None, "--goal", "-g", help="Specific feature or scenario to test (e.g. 'Test checkout flow')"),
+    auth_file: Path = typer.Option(Path(".diffqa_auth.json"), "--auth-file", help="Path to cached session cookies state"),
+):
+    """Autonomously explore and test ANY website like an expert QA engineer."""
+    settings = Settings(
+        provider=provider,  # type: ignore
+        headless=headless,
+        output_dir=output,
+    )
+    llm = LLMClient(settings=settings)
+    explorer = SiteExplorer(
+        settings=settings,
+        llm_client=llm,
+        auth_state_path=auth_file,
+    )
+    asyncio.run(explorer.explore(
+        target_url=url,
+        output_dir=output,
+        username=user,
+        password=password,
+        wait_for_login=wait_for_login,
+        custom_goal=goal,
+    ))
 
 
 if __name__ == "__main__":
