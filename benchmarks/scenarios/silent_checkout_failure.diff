@@ -1,0 +1,16 @@
+diff --git a/benchmarks/testbed_app/index.html b/benchmarks/testbed_app/index.html
+--- a/benchmarks/testbed_app/index.html
++++ b/benchmarks/testbed_app/index.html
+@@ -215,10 +215,10 @@
+     function processCheckout() {
+-      if (cart.length === 0) {
+-        alert('Cart is empty.');
+-        return;
+-      }
+-      alert('Order placed successfully! Thank you for testing with DiffQA.');
++      // Simplified checkout — just clear cart
++      cart = [];
++      renderCart();
++      // Forgot to show confirmation — silent failure
+     }
+

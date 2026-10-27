@@ -5,16 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "diffqa"
 version = "0.1.0"
-description = "Autonomous PR Regression Testing Agent powered by Meta Models & Playwright"
+description = "Autonomous PR regression testing agent — maps code diffs to browser test flows, catches regressions, and synthesizes Playwright specs."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Kathan Modh", email = "kathanmodh@gmail.com" }
+    { name = "Kathan Modh", email = "kathanmodh25@gmail.com" }
 ]
-keywords = ["qa", "agent", "playwright", "testing", "llm", "diff", "regression", "meta"]
+keywords = [
+    "qa", "testing", "agent", "playwright", "regression",
+    "llm", "diff", "meta", "autonomous", "browser-testing",
+    "ci-cd", "github-actions"
+]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
@@ -28,7 +39,7 @@ dependencies = [
     "unidiff>=0.7.5",
     "jinja2>=3.1.3",
     "pillow>=10.2.0",
-    "python-dotenv>=1.0.1"
+    "python-dotenv>=1.0.1",
 ]
 
 [project.optional-dependencies]
@@ -36,8 +47,25 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "black>=24.0.0",
-    "ruff>=0.3.0"
+    "ruff>=0.3.0",
 ]
 
 [project.scripts]
 diffqa = "diffqa.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/KathanModh259/DiffQA"
+Repository = "https://github.com/KathanModh259/DiffQA"
+Issues = "https://github.com/KathanModh259/DiffQA/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.black]
+line-length = 120
+target-version = ["py310"]

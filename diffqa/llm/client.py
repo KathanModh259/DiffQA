@@ -1,46 +1,89 @@
-"""Unified LLM client supporting Meta Model API, Fireworks, Baseten, Modal, Ollama, and Mock."""
+"""Unified LLM client supporting Meta Model API, Fireworks, Baseten, Modal, Ollama, and Mock.
+
+The client dispatches completions to whichever provider is selected in
+``Settings.provider``.  A high-fidelity mock provider is included so that the
+full DiffQA pipeline (diff analysis → flow planning → browser agent →
+regression oracle → test synthesis) can be exercised entirely offline with
+zero API cost.
+"""
+
+from __future__ import annotations
 
 import json
 import logging
 from typing import Any, Dict, List, Optional
+
 import httpx
+
 from diffqa.config import Settings, get_settings
 
 logger = logging.getLogger("diffqa.llm")
 
+# ── Provider endpoint constants ────────────────────────────────────────────
+_FIREWORKS_BASE = "https://api.fireworks.ai/inference/v1/chat/completions"
+_BASETEN_BASE = "https://bridge.baseten.co/v1/chat/completions"
+_OLLAMA_BASE = "http://localhost:11434/api/chat"
+_HTTP_TIMEOUT = 90.0  # generous timeout for large model responses
+
 
 class LLMClient:
-    """Dispatches completions to Meta Model API or partner inference endpoints."""
+    """Dispatches chat completions to Meta Model API or partner inference endpoints."""
 
-    def __init__(self, settings: Optional[Settings] = None):
+    def __init__(self, settings: Optional[Settings] = None) -> None:
         self.settings = settings or get_settings()
+
+    # ── Public API ─────────────────────────────────────────────────────
 
     async def complete(
         self,
         messages: List[Dict[str, Any]],
         model: Optional[str] = None,
         temperature: float = 0.2,
-        max_tokens: int = 2048,
+        max_tokens: int = 4096,
         json_mode: bool = False,
     ) -> str:
-        """Call the configured model provider and return text completion."""
+        """Send a chat completion request and return the assistant text."""
         provider = self.settings.provider
         target_model = model or self.settings.code_model
 
-        if provider == "mock":
-            return self._mock_completion(messages, target_model)
+        dispatch = {
+            "mock": lambda: self._mock_completion(messages, target_model),
+            "meta": lambda: self._call_openai_compat(
+                messages, target_model, temperature, max_tokens, json_mode,
+                base_url=f"{self.settings.meta_api_base}/chat/completions",
+                api_key=self.settings.meta_api_key,
+                auth_prefix="Bearer",
+            ),
+            "fireworks": lambda: self._call_openai_compat(
+                messages, target_model, temperature, max_tokens, json_mode,
+                base_url=_FIREWORKS_BASE,
+                api_key=self.settings.fireworks_api_key,
+                auth_prefix="Bearer",
+            ),
+            "baseten": lambda: self._call_openai_compat(
+                messages, target_model, temperature, max_tokens, json_mode,
+                base_url=_BASETEN_BASE,
+                api_key=self.settings.baseten_api_key,
+                auth_prefix="Api-Key",
+            ),
+            "modal": lambda: self._call_openai_compat(
+                messages, target_model, temperature, max_tokens, json_mode,
+                base_url=f"{self.settings.meta_api_base}/chat/completions",
+                api_key=self.settings.modal_api_key,
+                auth_prefix="Bearer",
+            ),
+            "ollama": lambda: self._call_ollama(messages, target_model, temperature, max_tokens, json_mode),
+        }
 
-        if provider == "meta":
-            return await self._call_meta_api(messages, target_model, temperature, max_tokens, json_mode)
-        elif provider == "fireworks":
-            return await self._call_fireworks(messages, target_model, temperature, max_tokens, json_mode)
-        elif provider == "baseten":
-            return await self._call_baseten(messages, target_model, temperature, max_tokens, json_mode)
-        elif provider == "ollama":
-            return await self._call_ollama(messages, target_model, temperature, max_tokens, json_mode)
-        else:
-            logger.warning(f"Unknown or unsupported provider '{provider}', falling back to mock provider.")
+        handler = dispatch.get(provider)
+        if handler is None:
+            logger.warning("Unknown provider '%s', falling back to mock.", provider)
             return self._mock_completion(messages, target_model)
+        result = handler()
+        # handle both sync (mock) and async returns
+        if hasattr(result, "__await__"):
+            return await result
+        return result
 
     async def complete_json(
         self,
@@ -48,50 +91,34 @@ class LLMClient:
         model: Optional[str] = None,
         temperature: float = 0.1,
     ) -> Dict[str, Any]:
-        """Convenience method to request and parse JSON from the model."""
-        raw_text = await self.complete(messages, model=model, temperature=temperature, json_mode=True)
-        # Clean potential markdown fences ```json ... ```
-        cleaned = raw_text.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            cleaned = "\n".join(lines).strip()
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as err:
-            logger.error(f"Failed to parse LLM JSON response: {err}. Raw response: {raw_text[:200]}")
-            # Try finding first { and last }
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                try:
-                    return json.loads(cleaned[start : end + 1])
-                except Exception:
-                    pass
-            raise ValueError(f"Model output could not be parsed as JSON: {raw_text}") from err
+        """Request a completion, parse and return the result as a JSON dict."""
+        raw = await self.complete(messages, model=model, temperature=temperature, json_mode=True)
+        return self._parse_json(raw)
 
-    async def _call_meta_api(
+    # ── Private provider methods ───────────────────────────────────────
+
+    async def _call_openai_compat(
         self,
         messages: List[Dict[str, Any]],
         model: str,
         temperature: float,
         max_tokens: int,
         json_mode: bool,
+        *,
+        base_url: str,
+        api_key: Optional[str],
+        auth_prefix: str = "Bearer",
     ) -> str:
-        """Call Meta Model API endpoint."""
-        api_key = self.settings.meta_api_key
+        """Generic caller for any OpenAI-compatible chat/completions endpoint."""
         if not api_key:
-            logger.warning("META_API_KEY is not set. Falling back to mock completion.")
+            logger.warning("API key missing for %s — falling back to mock.", base_url)
             return self._mock_completion(messages, model)
 
         headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"{auth_prefix} {api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
+        payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
@@ -100,76 +127,11 @@ class LLMClient:
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{self.settings.meta_api_base}/chat/completions",
-                headers=headers,
-                json=payload,
-            )
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            resp = await client.post(base_url, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
             return data["choices"][0]["message"]["content"]
-
-    async def _call_fireworks(
-        self,
-        messages: List[Dict[str, Any]],
-        model: str,
-        temperature: float,
-        max_tokens: int,
-        json_mode: bool,
-    ) -> str:
-        """Call Fireworks AI endpoint."""
-        api_key = self.settings.fireworks_api_key
-        if not api_key:
-            logger.warning("FIREWORKS_API_KEY not set. Falling back to mock completion.")
-            return self._mock_completion(messages, model)
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                "https://api.fireworks.ai/inference/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
-
-    async def _call_baseten(
-        self,
-        messages: List[Dict[str, Any]],
-        model: str,
-        temperature: float,
-        max_tokens: int,
-        json_mode: bool,
-    ) -> str:
-        """Call Baseten deployed endpoint."""
-        api_key = self.settings.baseten_api_key
-        if not api_key:
-            return self._mock_completion(messages, model)
-        # Baseten OpenAI-compatible proxy or model endpoint
-        headers = {"Authorization": f"Api-Key {api_key}"}
-        payload = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"https://bridge.baseten.co/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
 
     async def _call_ollama(
         self,
@@ -179,8 +141,8 @@ class LLMClient:
         max_tokens: int,
         json_mode: bool,
     ) -> str:
-        """Call local Ollama instance for Meta open-weights models (e.g. llama3.2)."""
-        payload = {
+        """Call a local Ollama instance (e.g. llama3.3, llama3.2-vision)."""
+        payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "options": {"temperature": temperature},
@@ -188,100 +150,142 @@ class LLMClient:
         }
         if json_mode:
             payload["format"] = "json"
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post("http://localhost:11434/api/chat", json=payload)
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            resp = await client.post(_OLLAMA_BASE, json=payload)
             resp.raise_for_status()
             return resp.json()["message"]["content"]
 
+    # ── JSON parsing helper ────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_json(raw_text: str) -> Dict[str, Any]:
+        """Robustly parse JSON from LLM output, stripping fences if present."""
+        cleaned = raw_text.strip()
+        # Strip markdown code fences
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+        # Fallback: extract first JSON object
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(cleaned[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+        # Last resort: try extracting JSON array
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(cleaned[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+        raise ValueError(f"Could not parse JSON from model output (first 300 chars): {raw_text[:300]}")
+
+    # ── Mock provider ──────────────────────────────────────────────────
+
     def _mock_completion(self, messages: List[Dict[str, Any]], model: str) -> str:
-        """High-fidelity mock completion for development, benchmark runs, and offline tests."""
+        """Return context-aware mock responses for the full DiffQA pipeline.
+
+        The mock is designed to exercise every module (planner, agent, judge)
+        end-to-end so that ``diffqa demo`` and ``diffqa eval`` work
+        deterministically without any API keys.
+        """
         prompt_text = " ".join(str(m.get("content", "")) for m in messages).lower()
 
-        # Check if flow planner request
-        if "flow planner" in prompt_text or "test flows" in prompt_text or "affected routes" in prompt_text or "plan user flows" in prompt_text:
+        # ── Flow Planner mock ──────────────────────────────────────────
+        if any(kw in prompt_text for kw in ("flow planner", "test flows", "affected routes", "plan user flows", "map out")):
             return json.dumps({
-                "summary": "Diff changes Cart component and order calculations.",
+                "summary": "PR modifies cart state management — quantity updates, item removal, and subtotal calculation logic.",
                 "affected_routes": ["/", "/cart", "/checkout"],
-                "risk_assessment": "High risk of state corruption when changing item quantities or removing cart items.",
+                "risk_assessment": "HIGH — removing the qty <= 0 guard allows negative quantities and corrupted subtotals.",
                 "flows": [
                     {
                         "flow_id": "flow-cart-quantity-update",
                         "title": "Update item quantity in cart",
                         "route": "/cart",
                         "flow_type": "happy_path",
-                        "goal": "Verify updating item quantity accurately recalibrates subtotal and tax.",
+                        "goal": "Verify updating item quantity recalculates subtotal correctly.",
                         "steps": [
                             "Navigate to '/' and add a product to cart",
                             "Navigate to '/cart'",
                             "Click increment quantity button",
-                            "Verify quantity is 2 and total matches unit price * 2"
+                            "Verify quantity is 2 and subtotal matches unit_price * 2",
                         ],
                         "invariants": [
-                            "Subtotal equals unit price * quantity",
-                            "No NaN or negative numbers displayed in pricing",
-                            "No uncaught console JavaScript exceptions"
-                        ]
+                            "Subtotal == unit_price * quantity for each item",
+                            "No NaN or negative values in pricing display",
+                            "No uncaught JavaScript exceptions in console",
+                        ],
                     },
                     {
                         "flow_id": "flow-cart-negative-boundary",
                         "title": "Decrement item quantity below zero",
                         "route": "/cart",
                         "flow_type": "adversarial",
-                        "goal": "Verify decrementing quantity at 1 either removes item or disables button, preventing negative counts.",
+                        "goal": "Verify decrementing quantity at 1 removes item or clamps to zero — never goes negative.",
                         "steps": [
-                            "Navigate to '/cart' with 1 item",
-                            "Click decrement button multiple times",
-                            "Verify quantity does not become 0 or negative without removing item properly"
+                            "Navigate to '/cart' with 1 item (qty=1)",
+                            "Click decrement button repeatedly",
+                            "Verify quantity never becomes 0 or negative without item removal",
                         ],
                         "invariants": [
-                            "Item quantity cannot be negative",
-                            "Cart total is non-negative",
-                            "Checkout button is disabled if cart is empty"
-                        ]
-                    }
-                ]
+                            "Item quantity >= 0 at all times",
+                            "Cart total is always non-negative",
+                            "Checkout button disables when cart is empty",
+                        ],
+                    },
+                ],
             })
 
-        # Check if browser agent next action request
-        if "select next browser action" in prompt_text or "available interactive elements" in prompt_text or "choose the next action" in prompt_text:
+        # ── Browser Agent mock ─────────────────────────────────────────
+        if any(kw in prompt_text for kw in ("choose the next action", "available interactive elements", "select next browser action")):
             if "btn-qty-decrement" in prompt_text:
                 return json.dumps({
-                    "thought": "Found decrement button in cart. Clicking decrement to verify boundary behavior.",
+                    "thought": "Decrement button is visible. Clicking to test qty boundary behavior.",
                     "action": "click",
                     "target_id": "btn-qty-decrement",
                     "value": None,
-                    "is_terminal": True
+                    "is_terminal": True,
                 })
             return json.dumps({
-                "thought": "Adding product to cart to initialize cart state.",
+                "thought": "Adding a product to cart to set up the test scenario.",
                 "action": "click",
                 "target_id": "btn-add-to-cart-1",
                 "value": None,
-                "is_terminal": False
+                "is_terminal": False,
             })
 
-        # Check if regression judge request
-        if "regression judge" in prompt_text or "judge regression" in prompt_text:
+        # ── Regression Judge mock ──────────────────────────────────────
+        if any(kw in prompt_text for kw in ("regression judge", "judge regression", "evaluate whether", "regression")):
             return json.dumps({
                 "verdict": "FAIL",
                 "bug_type": "functional_regression",
-                "title": "Quantity decrements to negative count and subtotal displays negative balance",
-                "root_cause_hypothesis": "The updated decrement logic in Cart.tsx does not check Math.max(0, qty - 1).",
+                "title": "Cart quantity decrements to negative value; subtotal displays negative balance",
+                "root_cause_hypothesis": "The refactored changeQuantity() removed the `if (item.qty <= 0)` guard that previously filtered the item from the cart array.",
                 "severity": "CRITICAL",
                 "repro_steps": [
-                    "1. Added item to cart",
-                    "2. Navigated to /cart",
-                    "3. Clicked decrement button twice",
-                    "4. Quantity showed -1 and Total was -$29.99"
+                    "1. Add 'Meta Ray-Ban Smart Glasses' to cart",
+                    "2. Navigate to /cart",
+                    "3. Click the '-' (decrement) button twice",
+                    "4. Observe: quantity shows -1, subtotal shows -$299.00",
                 ],
-                "confidence": 0.95
+                "confidence": 0.96,
             })
 
-        # Fallback default JSON or text
-        return json.dumps({"status": "ok", "message": "DiffQA mock completion executed successfully."})
+        # ── Fallback ───────────────────────────────────────────────────
+        return json.dumps({"status": "ok", "message": "DiffQA mock — no specific handler matched."})
 
 
 def get_llm_client(settings: Optional[Settings] = None) -> LLMClient:
-    """Factory function for LLMClient."""
+    """Factory function returning a configured LLMClient."""
     return LLMClient(settings=settings)
-

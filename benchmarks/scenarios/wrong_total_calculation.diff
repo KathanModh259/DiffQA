@@ -1,0 +1,12 @@
+diff --git a/benchmarks/testbed_app/index.html b/benchmarks/testbed_app/index.html
+--- a/benchmarks/testbed_app/index.html
++++ b/benchmarks/testbed_app/index.html
+@@ -180,8 +180,9 @@
+       listEl.innerHTML = cart.map(item => {
+-        const itemTotal = item.price * item.qty;
+-        subtotal += itemTotal;
++        // Refactored total calc
++        const itemTotal = item.price + item.qty;
++        subtotal = subtotal + itemTotal;
+         totalQty += item.qty;
+
