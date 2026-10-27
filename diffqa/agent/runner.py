@@ -12,6 +12,7 @@ from diffqa.agent.browser import BrowserController
 from diffqa.agent.dom_observer import DOMObserver
 from diffqa.analyzer.flow_planner import UserFlow
 from diffqa.config import Settings, get_settings
+from diffqa.agent.sanity import check_page_text
 from diffqa.llm.client import LLMClient, get_llm_client
 
 logger = logging.getLogger("diffqa.agent")
@@ -27,11 +28,15 @@ class FlowRunResult(BaseModel):
     uncaught_errors: List[str] = Field(default_factory=list)
     network_failures: List[Dict[str, Any]] = Field(default_factory=list)
     final_page_text: str = ""
+    # Deterministic sanity findings from rendered text, split by how certain they are (see judge.sanity).
+    hard_findings: List[str] = Field(default_factory=list)
+    soft_findings: List[str] = Field(default_factory=list)
     # Set when DiffQA itself couldn't test (site unreachable, model down): not evidence of an app bug.
     infra_error: Optional[str] = None
 
 
 MAX_PAGE_TEXT_CHARS = 4000
+STEP_PAGE_TEXT_CHARS = 1500
 MAX_PROMPT_ELEMENTS = 80
 MAX_LLM_FAILURES = 3
 
@@ -62,7 +67,11 @@ Supported actions:
 - `scroll`: Scroll down or up (value in pixels, e.g. "300").
 - `press`: Press a keyboard key (e.g. "Enter", "Tab", "Escape").
 - `wait`: Pause for milliseconds (value e.g. "1000").
-- `assert`: Assert text or state.
+- `assert`: Check an expectation. Put the text you expect to see on the page in `value`, or a target_id
+  that must be visible. A failed assert is recorded as evidence, so assert what the goal and invariants promise.
+
+Test like a careful human: after each action, read what changed (the "Page now shows" line and any dialog
+text). Before finishing, assert the key expected outcome. Do not repeat an action that already failed.
 
 You MUST respond strictly with a valid JSON object:
 {
@@ -109,6 +118,8 @@ class BrowserAgentRunner:
         all_screenshots: List[str] = []
         uncaught_errors: List[str] = []
         network_failures: List[Dict[str, Any]] = []
+        hard_findings: List[str] = []
+        soft_findings: List[str] = []
 
         self.controller.drain_diagnostics()  # don't inherit errors from the previous flow
         try:
@@ -148,11 +159,10 @@ class BrowserAgentRunner:
                 saved_screenshot = None
 
             # 3. Build prompt for Next Action
-            history_text = "\n".join(
-                f"Step {s.step_number}: [{s.action.action.value}] target={s.action.target_id} value='{s.action.value}' "
-                f"(success={s.success}{', error=' + s.error_message[:150] if s.error_message else ''})"
-                for s in steps
-            ) or "None (just landed on page)"
+            history_text = "\n".join(self._describe_step(s) for s in steps) or "None (just landed on page)"
+            if time.time() - start_time > self.settings.flow_timeout_seconds:
+                logger.warning(f"Flow '{flow.flow_id}' hit its {self.settings.flow_timeout_seconds}s budget.")
+                break
 
             user_prompt = f"""Target Flow: {flow.title}
 Flow Type: {flow.flow_type}
@@ -218,12 +228,16 @@ Choose the next action to advance this test."""
                 except Exception as e:
                     logger.warning(f"Could not return from external page {left_to}: {e}")
 
-            # 6. Drain diagnostics (console and network errors)
+            # 6. Observe the outcome the way a tester would, then drain diagnostics
             diag = self.controller.drain_diagnostics()
-            if diag["page_errors"]:
-                uncaught_errors.extend(diag["page_errors"])
-            if diag["network"]:
-                network_failures.extend(diag["network"])
+            uncaught_errors.extend(diag["page_errors"])
+            network_failures.extend(diag["network"])
+            page_text_after = await self.controller.page_text(STEP_PAGE_TEXT_CHARS)
+            elements_after = await self.dom.extract_interactive_elements(self.controller.page)
+            observations = []
+            for finding in check_page_text(page_text_after):
+                observations.append(str(finding))
+                (hard_findings if finding.hard else soft_findings).append(f"Step {step_num}: {finding}")
 
             step_record = ExecutionStep(
                 step_number=step_num,
@@ -236,6 +250,10 @@ Choose the next action to advance this test."""
                 success=exec_success,
                 error_message=error_msg,
                 duration_ms=(time.time() - step_start) * 1000,
+                dialogs=diag["dialogs"],
+                page_text_after=page_text_after,
+                elements_after=[_element_label(el) for el in elements_after[:MAX_PROMPT_ELEMENTS]],
+                observations=observations,
             )
             steps.append(step_record)
 
@@ -243,15 +261,13 @@ Choose the next action to advance this test."""
                 terminal_reached = True
                 break
 
-        try:
-            final_page_text = (await self.controller.page.inner_text("body"))[:MAX_PAGE_TEXT_CHARS]
-        except Exception:
-            final_page_text = ""
+        final_page_text = await self.controller.page_text(MAX_PAGE_TEXT_CHARS)
 
         duration = time.time() - start_time
         overall_success = (
-            len(uncaught_errors) == 0
-            and len([n for n in network_failures if n.get("status", 0) >= 500]) == 0
+            not uncaught_errors
+            and not hard_findings
+            and not any(n.get("status", 0) >= 500 for n in network_failures)
             and all(s.success for s in steps)
         )
 
@@ -265,5 +281,35 @@ Choose the next action to advance this test."""
             uncaught_errors=uncaught_errors,
             network_failures=network_failures,
             final_page_text=final_page_text,
+            hard_findings=_dedupe(hard_findings),
+            soft_findings=_dedupe(soft_findings),
         )
+
+    @staticmethod
+    def _describe_step(s: ExecutionStep) -> str:
+        line = (f"Step {s.step_number}: [{s.action.action.value}] target={s.action.target_id} value='{s.action.value}' "
+                f"(success={s.success}{', error=' + s.error_message[:150] if s.error_message else ''})")
+        for d in s.dialogs:
+            line += f"\n    Dialog appeared: {d[:200]}"
+        for o in s.observations:
+            line += f"\n    Looks wrong: {o}"
+        if s.page_text_after:
+            line += f"\n    Page now shows: {s.page_text_after[:400]}"
+        return line
+
+
+def _element_label(el) -> str:
+    text = el.text or el.aria_label or el.placeholder or el.value or ""
+    return f"[{el.diffqa_id}] <{el.tag}>" + (f" {text[:40]!r}" if text else "") + (" (DISABLED)" if el.is_disabled else "")
+
+
+def _dedupe(items: List[str]) -> List[str]:
+    """Keep the first occurrence of each finding (the 'Step N: ' prefix is ignored for comparison)."""
+    seen, out = set(), []
+    for item in items:
+        key = item.split(": ", 1)[-1]
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
 

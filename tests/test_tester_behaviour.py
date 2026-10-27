@@ -1,0 +1,205 @@
+"""Tests for the human-tester behaviours: sanity checks, dialogs, assertions, re-runs, evidence in reports."""
+
+from pathlib import Path
+
+import pytest
+
+from benchmarks.serve import serve_in_background
+from diffqa.agent.browser import BrowserController
+from diffqa.agent.runner import BrowserAgentRunner, FlowRunResult
+from diffqa.agent.sanity import check_page_text
+from diffqa.analyzer.flow_planner import TestFlowPlan, UserFlow
+from diffqa.benchmark import build_testbed
+from diffqa.config import Settings
+from diffqa.judge.oracle import JudgeVerdict, RegressionJudge
+from diffqa.pipeline import execute_plan
+from diffqa.reporter.dashboard import DashboardGenerator
+from diffqa.reporter.markdown import FlowReportItem, PRReportGenerator, reproduction_note
+
+SCENARIOS = Path(__file__).resolve().parent.parent / "benchmarks" / "scenarios"
+
+
+class TestSanityChecks:
+
+    @pytest.mark.parametrize("text,label,hard", [
+        ("Total: $NaN", "NaN rendered as a price or percentage", True),
+        ("Hello [object Object]", "unrendered object", True),
+        ("Welcome {{ user.name }}", "unrendered template placeholder", True),
+        ("Subtotal $-299.00", "negative currency amount", False),
+        ("Name: undefined", "'undefined' rendered", False),
+        ("Internal Server Error", "error page or stack trace", False),
+    ])
+    def test_detects(self, text, label, hard):
+        found = [f for f in check_page_text(text) if label in f.label]
+        assert found and found[0].hard is hard
+
+    def test_clean_text_has_no_findings(self):
+        assert not check_page_text("Cart (2)  Subtotal $598.00  Checkout  Thank you for your order")
+        assert not check_page_text("undefined-behaviour.html is a file; user.null.name; NaNoWriMo")
+
+    def test_refund_is_only_a_soft_finding(self):
+        findings = check_page_text("Refund -$20.00 applied")
+        assert [f.label for f in findings] == ["negative currency amount"]
+        assert findings[0].hard is False
+
+
+class ScriptedLLM:
+    """Plays a fixed list of agent actions, then terminates; answers the judge with a fixed verdict."""
+
+    def __init__(self, actions, verdict="PASS"):
+        self.actions = list(actions)
+        self.verdict = verdict
+        self.judge_prompts = []
+
+    async def complete_json(self, messages, model=None):
+        prompt = messages[-1]["content"]
+        if "Evaluate whether this constitutes" in prompt:
+            self.judge_prompts.append(prompt)
+            return {"verdict": self.verdict, "title": "scripted"}
+        if self.actions:
+            return self.actions.pop(0)
+        return {"action": "wait", "value": "100", "is_terminal": True}
+
+
+async def _run_scripted(tmp_path, diff_name, actions, verdict="PASS"):
+    site = tmp_path / "site"
+    site.mkdir()
+    build_testbed(SCENARIOS / diff_name if diff_name else None, site)
+    settings = Settings(provider="mock", headless=True, max_steps_per_flow=10, rerun_failures=False)
+    llm = ScriptedLLM(actions, verdict)
+    server, url = serve_in_background(site)
+    controller = BrowserController(settings=settings)
+    try:
+        try:
+            await controller.start()
+        except RuntimeError as e:
+            pytest.skip(str(e))
+        flow = UserFlow(flow_id="scripted", title="Scripted", goal="g", invariants=["Totals never negative"])
+        runner = BrowserAgentRunner(controller=controller, llm_client=llm, settings=settings)
+        result = await runner.run_flow(flow, base_url=url, artifacts_dir=tmp_path / "out")
+        judge_verdict = await RegressionJudge(llm_client=llm, settings=settings).judge_flow(result)
+        return result, judge_verdict, llm
+    finally:
+        await controller.close()
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.asyncio
+async def test_dialogs_are_read_and_shown_to_judge(tmp_path):
+    actions = [
+        {"action": "click", "target_id": "btn-add-to-cart-1"},
+        {"action": "click", "target_id": "btn-checkout"},
+    ]
+    result, _, llm = await _run_scripted(tmp_path, None, actions)
+    assert any("Order placed successfully" in d for d in result.steps[1].dialogs)
+    assert "Dialog: alert: Order placed successfully" in llm.judge_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_negative_total_is_observed_and_reported(tmp_path):
+    actions = [
+        {"action": "click", "target_id": "btn-add-to-cart-1"},
+        {"action": "click", "target_id": "btn-qty-decrement"},
+        {"action": "click", "target_id": "btn-qty-decrement"},
+    ]
+    result, _, llm = await _run_scripted(tmp_path, "negative_cart_qty.diff", actions)
+    assert any("negative currency" in f for f in result.soft_findings)
+    assert "$-299.00" in result.steps[-1].page_text_after
+    assert "Looks wrong: negative currency amount" in llm.judge_prompts[0]
+    assert "Page then showed:" in llm.judge_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_failed_assertion_is_evidence(tmp_path):
+    actions = [
+        {"action": "click", "target_id": "btn-add-to-cart-1"},
+        {"action": "assert", "value": "Order placed"},
+    ]
+    result, verdict, _ = await _run_scripted(tmp_path, None, actions, verdict="PASS")
+    assert result.steps[1].success is False
+    assert "Assertion failed" in result.steps[1].error_message
+    assert any("Assertion failed" in e for e in verdict.evidence_logs)
+
+
+@pytest.mark.asyncio
+async def test_passing_assertion_and_missing_control_visible_to_judge(tmp_path):
+    actions = [
+        {"action": "click", "target_id": "btn-add-to-cart-1"},
+        {"action": "assert", "value": "Cart (1)"},
+    ]
+    result, _, llm = await _run_scripted(tmp_path, "hidden_checkout_css.diff", actions)
+    assert result.steps[1].success is True
+    assert "btn-checkout" not in "\n".join(result.steps[-1].elements_after)
+    assert "Interactive controls present at the end:" in llm.judge_prompts[0]
+
+
+class TestRerunToConfirm:
+
+    @pytest.mark.asyncio
+    async def test_failure_is_rerun_and_marked(self, tmp_path, monkeypatch):
+        runs = []
+
+        async def fake_run_flow(self, flow, base_url, artifacts_dir=None):
+            runs.append(artifacts_dir.name)
+            return FlowRunResult(flow=flow, uncaught_errors=["TypeError: boom"], success=False)
+
+        async def fake_judge(self, result):
+            return JudgeVerdict(flow_id=result.flow.flow_id, passed=False, verdict="FAIL", title="boom")
+
+        monkeypatch.setattr(BrowserAgentRunner, "run_flow", fake_run_flow)
+        monkeypatch.setattr(RegressionJudge, "judge_flow", fake_judge)
+        plan = TestFlowPlan(flows=[UserFlow(flow_id="f1")])
+        settings = Settings(provider="mock", rerun_failures=True)
+        items = await execute_plan(plan, "http://x", controller=None, llm=None, settings=settings, output_dir=tmp_path)
+        assert runs == ["f1", "f1-rerun"]
+        assert items[0].verdict.reproduced is True
+        assert items[0].spec_code_ts
+
+    @pytest.mark.asyncio
+    async def test_intermittent_failure_lowers_confidence(self, tmp_path, monkeypatch):
+        outcomes = iter([False, True])
+
+        async def fake_run_flow(self, flow, base_url, artifacts_dir=None):
+            return FlowRunResult(flow=flow)
+
+        async def fake_judge(self, result):
+            ok = next(outcomes)
+            return JudgeVerdict(flow_id="f1", passed=ok, verdict="PASS" if ok else "FAIL", confidence=0.9)
+
+        monkeypatch.setattr(BrowserAgentRunner, "run_flow", fake_run_flow)
+        monkeypatch.setattr(RegressionJudge, "judge_flow", fake_judge)
+        plan = TestFlowPlan(flows=[UserFlow(flow_id="f1")])
+        items = await execute_plan(plan, "http://x", None, None, Settings(provider="mock"), tmp_path)
+        assert items[0].verdict.reproduced is False
+        assert items[0].verdict.confidence <= 0.5
+        assert "intermittent" in reproduction_note(items[0].verdict)
+
+
+class TestEvidenceInReports:
+
+    def _item(self, tmp_path):
+        shot = tmp_path / "step_3.png"
+        shot.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        verdict = JudgeVerdict(
+            flow_id="f1", passed=False, verdict="FAIL", title="Total is wrong", reproduced=True,
+            evidence_logs=["Rendering defect at Step 2: NaN rendered"], repro_steps=["1. Add item", "2. Look at total"],
+            screenshot_evidence=str(shot),
+        )
+        return FlowReportItem(flow_id="f1", title="Cart", route="/", flow_type="happy_path", passed=False,
+                              verdict=verdict, steps_count=4, assertions_count=1, invariants=["Total == sum"])
+
+    def test_markdown_has_reproduction_evidence_and_coverage(self, tmp_path):
+        md = PRReportGenerator().generate_report(TestFlowPlan(), [self._item(tmp_path)])
+        assert "Reproduced on re-run (2/2)" in md
+        assert "Rendering defect at Step 2" in md
+        assert "step_3.png" in md
+        assert "| `f1` | 4 | 1 | Total == sum |" in md
+        assert "Not covered by this run" in md
+
+    def test_dashboard_embeds_screenshot_and_repro_steps(self, tmp_path):
+        html = DashboardGenerator().generate_html(TestFlowPlan(), [self._item(tmp_path)])
+        assert 'src="data:image/png;base64,iVBOR' in html
+        assert "2. Look at total" in html
+        assert "Reproduced on re-run" in html
+        assert "Coverage: what this run checked" in html

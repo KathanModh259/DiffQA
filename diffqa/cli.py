@@ -82,18 +82,34 @@ def run(
     output: Path = typer.Option(Path("./diffqa_output"), "--output", "-o", help="Output directory for reports and specs"),
     provider: str = typer.Option("meta", "--provider", "-p", help=PROVIDER_HELP),
     headless: bool = typer.Option(True, "--headless/--headed", help="Run browser in headless mode"),
+    viewport: str = typer.Option("desktop", "--viewport", help="desktop (1280x800) or mobile (390x844)"),
+    rerun: bool = typer.Option(True, "--rerun/--no-rerun", help="Re-run failed flows once to confirm they reproduce"),
 ):
     """Execute DiffQA: parse diff, run autonomous browser flows, judge regressions, and synthesize tests.
 
     Exits with status 1 when any flow fails, so it can gate CI.
     """
-    failed = asyncio.run(_run_pipeline(diff, url, output, provider, headless))
+    settings = _settings(provider, headless, output, viewport, rerun)
+    failed = asyncio.run(_run_pipeline(diff, url, settings))
     raise typer.Exit(code=1 if failed else 0)
 
 
-async def _run_pipeline(diff_path: Path, url: str, output_dir: Path, provider: str, headless: bool) -> int:
+VIEWPORTS = {"desktop": (1280, 800), "mobile": (390, 844)}
+
+
+def _settings(provider: str, headless: bool, output: Path, viewport: str = "desktop", rerun: bool = True) -> Settings:
+    if viewport not in VIEWPORTS:
+        raise typer.BadParameter(f"--viewport must be one of {', '.join(VIEWPORTS)}")
+    width, height = VIEWPORTS[viewport]
+    return Settings(  # type: ignore[arg-type]
+        provider=provider, headless=headless, output_dir=output,
+        viewport_width=width, viewport_height=height, rerun_failures=rerun,
+    )
+
+
+async def _run_pipeline(diff_path: Path, url: str, settings: Settings) -> int:
     """Run the full pipeline and return the number of failed flows."""
-    settings = Settings(provider=provider, headless=headless, output_dir=output_dir)  # type: ignore[arg-type]
+    output_dir, provider = settings.output_dir, settings.provider
     llm = LLMClient(settings=settings)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -184,7 +200,7 @@ def demo(
             f"Testbed with [yellow]{scenario}[/yellow] applied, serving at [green]{url}[/green]"
         ))
         try:
-            asyncio.run(_run_pipeline(diff_path, url, output, provider, headless))
+            asyncio.run(_run_pipeline(diff_path, url, _settings(provider, headless, output)))
         finally:
             server.shutdown()
             server.server_close()
@@ -201,9 +217,11 @@ def explore(
     password: Optional[str] = typer.Option(None, "--password", help="Password for automated login"),
     goal: Optional[str] = typer.Option(None, "--goal", "-g", help="Specific feature or scenario to test (e.g. 'Test checkout flow')"),
     auth_file: Path = typer.Option(Path(".diffqa_auth.json"), "--auth-file", help="Path to cached session cookies state"),
+    viewport: str = typer.Option("desktop", "--viewport", help="desktop (1280x800) or mobile (390x844)"),
+    rerun: bool = typer.Option(True, "--rerun/--no-rerun", help="Re-run failed flows once to confirm they reproduce"),
 ):
     """Autonomously explore and test ANY website like an expert QA engineer."""
-    settings = Settings(provider=provider, headless=headless, output_dir=output)  # type: ignore[arg-type]
+    settings = _settings(provider, headless, output, viewport, rerun)
     explorer = SiteExplorer(settings=settings, llm_client=LLMClient(settings=settings), auth_state_path=auth_file)
     asyncio.run(explorer.explore(
         target_url=url,
@@ -261,6 +279,57 @@ async def _run_audit(url: str, output_dir: Path, headless: bool):
         console.print(f"Interactive Audit Dashboard: [bold yellow]{dash_file}[/bold yellow]")
     finally:
         await controller.close()
+
+
+@app.command()
+def doctor(
+    provider: str = typer.Option("meta", "--provider", "-p", help=PROVIDER_HELP),
+):
+    """Check that DiffQA can run: Python, Chromium, provider credentials, and a live model call."""
+    settings = Settings(provider=provider)  # type: ignore[arg-type]
+    ok = True
+
+    def report(label: str, passed: bool, detail: str = "") -> None:
+        nonlocal ok
+        ok = ok and passed
+        mark = "[green]OK[/green]" if passed else "[red]FAIL[/red]"
+        console.print(f"  {mark}  {label}" + (f" [dim]{detail}[/dim]" if detail else ""))
+
+    console.print(Panel.fit("[bold cyan]DiffQA Doctor[/bold cyan]"))
+    report("Python version", sys.version_info >= (3, 10), sys.version.split()[0])
+
+    async def check_browser() -> str:
+        controller = BrowserController(settings=settings)
+        try:
+            await controller.start()
+            return controller.page.context.browser.version if controller.page.context.browser else "unknown"
+        finally:
+            await controller.close()
+
+    try:
+        report("Playwright Chromium", True, asyncio.run(check_browser()))
+    except Exception as e:
+        report("Playwright Chromium", False, str(e))
+
+    key_present = provider == "mock" or provider == "ollama" or bool({
+        "meta": settings.meta_api_key, "fireworks": settings.fireworks_api_key,
+        "baseten": settings.baseten_api_key, "modal": settings.modal_api_key,
+    }.get(provider))
+    report(f"Credentials for provider '{provider}'", key_present, "" if key_present else "API key not set")
+
+    if key_present:
+        async def ping() -> dict:
+            return await LLMClient(settings=settings).complete_json(
+                [{"role": "user", "content": 'Reply with exactly this JSON: {"ok": true}'}], model=settings.code_model
+            )
+        try:
+            data = asyncio.run(ping())
+            report(f"Model call ({settings.code_model})", bool(data), str(data)[:80])
+        except Exception as e:
+            report(f"Model call ({settings.code_model})", False, str(e)[:200])
+
+    console.print("\n[bold green]Ready.[/bold green]" if ok else "\n[bold red]Fix the items above before running DiffQA.[/bold red]")
+    raise typer.Exit(code=0 if ok else 2)
 
 
 def main() -> None:

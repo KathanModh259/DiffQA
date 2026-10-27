@@ -180,6 +180,8 @@ DIFFQA_PROVIDER=mock
 | `diffqa scan --diff <file>` | Parses diff and previews planned flows without opening browser. |
 | `diffqa run --diff <file> --url <url>` | Runs autonomous QA on any custom PR diff and preview URL. Exits 1 if any flow fails. |
 | `diffqa serve --port 3000` | Starts the QuickShop testbed web application locally. |
+| `diffqa doctor` | Verifies Python, Chromium, provider credentials and a live model call. Run this first. |
+| `diffqa run ... --viewport mobile` | Runs the same flows at a 390×844 phone viewport. |
 | `diffqa audit <url>` | **Superhuman Invariant Audit**: catches layout overflow, text clipping, broken assets, WCAG a11y violations, and network errors. Generates interactive HTML dashboard. |
 | `python -m pytest` | Runs unit tests plus real-browser end-to-end tests (skipped if Chromium is not installed). |
 
@@ -206,6 +208,35 @@ diffqa explore https://app.example.com --auth-file .diffqa_auth.json
 # 4. Or pass credentials directly for hands-free automated login:
 diffqa explore https://app.example.com -u "admin@example.com" --password "Secret123!"
 ```
+
+---
+
+## 🔍 What DiffQA checks (and what it doesn't)
+
+DiffQA is built to be read like a human tester's report, so every run states what it covered.
+
+**On every step of every flow, without a model:**
+- Uncaught JavaScript exceptions and HTTP 5xx responses
+- Failed same-origin API calls (4xx on `fetch`/XHR, excluding auth and rate-limit statuses)
+- Rendering defects in visible text: `NaN`, `[object Object]`, unrendered `{{ templates }}`
+- Suspicious content flagged for the judge: negative amounts, `undefined`/`null`, error-page text
+- Every `alert`/`confirm` dialog is captured and read, never silently dismissed
+- Page text and the list of visible controls are recorded after each action
+
+**With a model (the judge):**
+- Each flow invariant is checked against what the page showed after the relevant step (prices × quantities, totals, counts)
+- The goal's expected outcome must have been observed: a missing confirmation, a vanished button, or a silent no-op after submit fails the flow even with clean logs
+- The agent can `assert` expected text or a visible control; a failed assertion is hard evidence
+
+**Trust signals in every report:**
+- Failed flows are re-run once; the report says **reproduced (2/2)** or **intermittent (1/2)**
+- Screenshot at the point of failure, evidence lines, and numbered reproduction steps
+- A coverage table: steps taken, assertions made and invariants checked per flow
+- Flows DiffQA could not run (preview down, model unavailable) are marked **Not tested**, never reported as app bugs, and still fail CI
+
+**Not covered:** pixel-level visual diffs, flows needing data or accounts the preview can't reach, and anything outside the planned flows. The offline `mock` provider only detects the deterministic checks above.
+
+Run `diffqa doctor` before a demo: it verifies Python, Chromium, credentials and a live model call.
 
 ---
 

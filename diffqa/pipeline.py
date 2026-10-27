@@ -6,6 +6,7 @@ from typing import List
 
 from rich.console import Console
 
+from diffqa.agent.actions import ActionType
 from diffqa.agent.browser import BrowserController
 from diffqa.agent.runner import BrowserAgentRunner, FlowRunResult, flow_url
 from diffqa.analyzer.flow_planner import TestFlowPlan
@@ -43,13 +44,27 @@ async def execute_plan(
             await controller.recover()
         verdict = await judge.judge_flow(result)
 
+        if not verdict.passed and verdict.verdict != "ERROR" and settings.rerun_failures:
+            # A tester confirms a bug before reporting it. Re-run once and say whether it reproduced.
+            console.print("  [yellow]Failure observed; re-running the flow to confirm...[/yellow]")
+            try:
+                second = await runner.run_flow(flow, base_url=base_url, artifacts_dir=output_dir / f"{flow.flow_id}-rerun")
+                second_verdict = await judge.judge_flow(second)
+                verdict.reproduced = not second_verdict.passed and second_verdict.verdict != "ERROR"
+                if not verdict.reproduced:
+                    verdict.confidence = min(verdict.confidence, 0.5)
+            except Exception as e:
+                logger.warning("Re-run of %s crashed: %s", flow.flow_id, e)
+                await controller.recover()
+
         spec_ts = None
         if verdict.passed:
             console.print("  [bold green]PASSED[/bold green]")
         elif verdict.verdict == "ERROR":
             console.print(f"  [bold yellow]NOT TESTED:[/bold yellow] {verdict.title}")
         else:
-            console.print(f"  [bold red]FAILED:[/bold red] {verdict.title}")
+            repro = {True: " (reproduced on re-run)", False: " (did not reproduce on re-run: intermittent)"}.get(verdict.reproduced, "")
+            console.print(f"  [bold red]FAILED:[/bold red] {verdict.title}{repro}")
             spec_path = output_dir / "specs" / f"{flow.flow_id}.spec.ts"
             spec_ts = synthesizer.synthesize_typescript(
                 verdict=verdict,
@@ -70,5 +85,8 @@ async def execute_plan(
             verdict=verdict,
             spec_code_ts=spec_ts,
             duration_seconds=result.duration_seconds,
+            steps_count=len(result.steps),
+            assertions_count=sum(1 for s in result.steps if s.action.action == ActionType.ASSERT),
+            invariants=flow.invariants,
         ))
     return items

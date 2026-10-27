@@ -32,6 +32,7 @@ class BrowserController:
         self.console_logs: List[Dict[str, str]] = []
         self.network_errors: List[Dict[str, Any]] = []
         self.page_errors: List[str] = []
+        self.dialogs: List[str] = []
 
     async def start(self, storage_state_path: Optional[Path | str] = None) -> None:
         """Initialize the Playwright engine and launch browser, optionally loading cached session cookies."""
@@ -112,10 +113,16 @@ class BrowserController:
                     "resource_type": response.request.resource_type,
                 })
 
+        async def on_dialog(dialog):
+            # Playwright would otherwise auto-dismiss alerts silently: a tester reads them.
+            self.dialogs.append(f"{dialog.type}: {dialog.message}")
+            await dialog.accept()
+
         self._page.on("console", on_console)
         self._page.on("pageerror", on_page_error)
         self._page.on("requestfailed", on_request_failed)
         self._page.on("response", on_response)
+        self._page.on("dialog", on_dialog)
 
     @property
     def page(self) -> Page:
@@ -169,8 +176,20 @@ class BrowserController:
             ms = min(max(_to_int(action.value, 1000), 0), 10_000)  # a model asking for 60s would stall the run
             await self.page.wait_for_timeout(ms)
         elif action.action == ActionType.ASSERT:
-            # Assertion action handled in execution step
-            pass
+            # Expected text must be visible on the page (or the target element must be visible).
+            if target_selector and not action.value:
+                if not await self.page.locator(target_selector).first.is_visible():
+                    raise AssertionError(f"Assertion failed: element {target_selector} is not visible")
+            elif action.value:
+                body = await self.page.inner_text("body")
+                if action.value.lower() not in body.lower():
+                    raise AssertionError(f"Assertion failed: expected text not on page: {action.value!r}")
+
+    async def page_text(self, limit: int) -> str:
+        try:
+            return " ".join((await self.page.inner_text("body")).split())[:limit]
+        except Exception:
+            return ""
 
     def drain_diagnostics(self) -> Dict[str, Any]:
         """Collect and clear pending logs and errors since last step."""
@@ -178,10 +197,12 @@ class BrowserController:
             "console": list(self.console_logs),
             "network": list(self.network_errors),
             "page_errors": list(self.page_errors),
+            "dialogs": list(self.dialogs),
         }
         self.console_logs.clear()
         self.network_errors.clear()
         self.page_errors.clear()
+        self.dialogs.clear()
         return res
 
     async def close(self) -> None:

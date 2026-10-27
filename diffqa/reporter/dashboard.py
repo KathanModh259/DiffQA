@@ -1,10 +1,13 @@
 """Interactive single-file HTML Dashboard Generator for DiffQA QA audits."""
 
+import base64
 from pathlib import Path
 from typing import List, Optional
 from diffqa.analyzer.flow_planner import TestFlowPlan
 from diffqa.judge.superhuman import SuperhumanAuditReport
-from diffqa.reporter.markdown import FlowReportItem
+from diffqa.reporter.markdown import AUTOMATIC_CHECKS, FlowReportItem, reproduction_note
+
+MAX_EMBEDDED_PNG = 2_000_000  # keep the single-file dashboard openable
 
 DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -64,7 +67,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         <div class="logo-badge">DiffQA</div>
         <div>
           <h2>Autonomous QA Audit Dashboard</h2>
-          <div class="header-meta">Target: <b>{{ preview_url }}</b> | Tested with Meta Model API</div>
+          <div class="header-meta">Target: <b>{{ preview_url }}</b> </div>
         </div>
       </div>
       <div>
@@ -138,10 +141,28 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
           Severity: <span class="badge badge-crit">{{ item.verdict.severity.value if item.verdict.severity else 'HIGH' }}</span> |
           Confidence: <b>{{ (item.verdict.confidence * 100)|int }}%</b>
         </p>
+        <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 0.75rem;">{{ reproduction_note(item.verdict) }}</p>
         {% if item.verdict.root_cause_hypothesis %}
         <p style="margin-bottom: 0.75rem;"><b>Root Cause Hypothesis:</b> {{ item.verdict.root_cause_hypothesis }}</p>
         {% endif %}
-        
+        {% if item.verdict.evidence_logs %}
+        <p style="margin-bottom: 0.25rem;"><b>Evidence:</b></p>
+        <ul style="margin: 0 0 0.75rem 1.25rem; color: var(--text-muted); font-size: 0.9rem;">
+          {% for e in item.verdict.evidence_logs %}<li><code>{{ e }}</code></li>{% endfor %}
+        </ul>
+        {% endif %}
+        {% if item.verdict.repro_steps %}
+        <p style="margin-bottom: 0.25rem;"><b>Reproduction steps:</b></p>
+        <ol style="margin: 0 0 0.75rem 1.25rem; font-size: 0.9rem;">
+          {% for s in item.verdict.repro_steps %}<li>{{ s }}</li>{% endfor %}
+        </ol>
+        {% endif %}
+        {% if screenshots.get(item.flow_id) %}
+        <p style="margin-bottom: 0.25rem;"><b>Screenshot at failure:</b></p>
+        <img src="data:image/png;base64,{{ screenshots[item.flow_id] }}" alt="Screenshot of {{ item.title }} at failure"
+             style="max-width: 100%; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 0.75rem;">
+        {% endif %}
+
         {% if item.spec_code_ts %}
         <div style="margin-top: 1rem;">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 0.5rem;">
@@ -156,6 +177,27 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
       {% endfor %}
     </div>
     {% endif %}
+
+    <div class="card">
+      <div class="card-title">Coverage: what this run checked</div>
+      <table>
+        <thead><tr><th>Flow</th><th>Steps</th><th>Assertions</th><th>Invariants checked</th></tr></thead>
+        <tbody>
+          {% for item in items %}
+          <tr>
+            <td><code>{{ item.flow_id }}</code></td>
+            <td>{{ item.steps_count }}</td>
+            <td>{{ item.assertions_count }}</td>
+            <td>{% if item.invariants %}{{ item.invariants|join('; ') }}{% else %}—{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 1rem;"><b>Automatic checks on every step:</b></p>
+      <ul style="margin: 0.25rem 0 0 1.25rem; color: var(--text-muted); font-size: 0.9rem;">
+        {% for c in automatic_checks %}<li>{{ c }}</li>{% endfor %}
+      </ul>
+    </div>
 
     <!-- Superhuman Invariant Audits -->
     {% if audit %}
@@ -177,7 +219,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     {% endif %}
 
     <footer>
-      Generated autonomously by <b>DiffQA</b> · Powered by Meta Model API (Muse Code, Muse Spark, Muse Wonder)
+      Generated autonomously by <b>DiffQA</b> · Powered by Meta Model API
     </footer>
   </div>
 </body>
@@ -203,8 +245,17 @@ class DashboardGenerator:
         quality_score = audit.quality_score if audit else (100 if failed_count == 0 else max(20, 100 - failed_count * 25))
 
         # Audit messages and verdicts carry text from the tested site and the model: escape it.
+        screenshots = {}
+        for item in items:
+            shot = item.verdict.screenshot_evidence
+            if not item.passed and shot and Path(shot).is_file() and Path(shot).stat().st_size <= MAX_EMBEDDED_PNG:
+                screenshots[item.flow_id] = base64.b64encode(Path(shot).read_bytes()).decode("ascii")
+
         tmpl = Template(DASHBOARD_TEMPLATE, autoescape=True)
         return tmpl.render(
+            screenshots=screenshots,
+            reproduction_note=reproduction_note,
+            automatic_checks=AUTOMATIC_CHECKS,
             preview_url=preview_url,
             plan=plan,
             items=items,

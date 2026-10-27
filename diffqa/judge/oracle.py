@@ -40,6 +40,8 @@ class JudgeVerdict(BaseModel):
     confidence: float = 1.0
     evidence_logs: List[str] = Field(default_factory=list)
     screenshot_evidence: Optional[str] = None
+    # Filled by the pipeline after re-running a failed flow: True = failed again, False = passed on retry.
+    reproduced: Optional[bool] = None
 
     # Model output is loose ("high", "95%", "Runtime Crash"); coerce rather than discard the verdict.
     @field_validator("severity", mode="before")
@@ -76,14 +78,20 @@ You analyze the recorded execution trace of an autonomous browser run on a web a
 
 You are provided with:
 1. The intended User Flow, Goal, and Invariants
-2. The sequence of actions executed
-3. Uncaught JavaScript errors and console logs
-4. Network errors (HTTP 4xx/5xx responses)
-5. Action execution failures
+2. A step-by-step trace: each action, any dialog that appeared, and what the page showed afterwards
+3. The final page text and the interactive controls present at the end
+4. Uncaught JavaScript errors, network failures, and deterministic rendering checks
 
-Determine whether a regression or bug occurred during the run.
-- If uncaught JS errors, 500 status codes, or invariant violations occurred, mark verdict as 'FAIL'.
-- Formulate a precise root cause hypothesis and step-by-step reproduction instructions.
+Judge like a meticulous human tester:
+- Verify each invariant against the page text after the relevant step (do the arithmetic: prices × quantities,
+  totals, counts). A number that does not add up, or a value that should never be negative, is a FAIL.
+- Verify the goal's expected outcome happened: a confirmation that never appeared, a control that should be
+  present but is missing, or a silent no-op after a submit is a FAIL even with no errors in the logs.
+- Uncaught JS errors, 5xx responses, and rendering defects ([object Object], NaN) are always a FAIL.
+- Do not fail a flow for the agent's own mistakes (clicking a wrong element) or for cosmetic text differences.
+- PASS only when the invariants held and the goal's outcome was observed; use WARNING when something looks
+  off but you cannot confirm it from the trace.
+- Give a precise root cause hypothesis and numbered reproduction steps a developer can follow.
 
 Respond strictly in valid JSON:
 {
@@ -139,6 +147,12 @@ class RegressionJudge:
             for s in run_result.steps
             if not s.success
         ]
+        evidence += [f"Rendering defect at {f}" for f in run_result.hard_findings]
+        warnings = [f"Suspicious page content at {f}" for f in run_result.soft_findings]
+        warnings += [
+            f"Console error at step {s.step_number}: {log['text'][:200]}"
+            for s in run_result.steps for log in s.console_logs if log.get("type") == "error"
+        ][:10]
         last_screenshot = run_result.all_screenshots[-1] if run_result.all_screenshots else None
         default_repro = [
             f"{i + 1}. {s.action.action.value}"
@@ -146,21 +160,24 @@ class RegressionJudge:
             for i, s in enumerate(run_result.steps)
         ]
 
-        steps_summary = "\n".join(
-            f"Step {s.step_number}: {s.action.action.value} on {s.action.target_id} (value={s.action.value}) -> Success={s.success}"
-            for s in run_result.steps
-        )
-        # Invariants like "subtotal == price * qty" are only checkable against what the page shows,
-        # so the model always sees the final visible text, even on error-free runs.
+        # The judge reads the run the way a tester would replay it: what was done, what the page
+        # then showed, which controls were present, and what dialogs appeared, step by step.
+        trace = "\n".join(self._describe_step(s) for s in run_result.steps) or "(no steps executed)"
+        last = run_result.steps[-1] if run_result.steps else None
+        controls = "\n".join(last.elements_after) if last and last.elements_after else "(none detected)"
         user_prompt = f"""User Flow: {flow.title}
 Goal: {flow.goal}
 Flow Invariants: {flow.invariants}
+Flow finished by agent: {run_result.terminal_reached}
 
-Execution Steps:
-{steps_summary}
+Step-by-step trace:
+{trace}
 
 Final Visible Page Text:
 {run_result.final_page_text or "(unavailable)"}
+
+Interactive controls present at the end:
+{controls}
 
 Uncaught Errors:
 {run_result.uncaught_errors}
@@ -168,10 +185,15 @@ Uncaught Errors:
 Network Failures:
 {run_result.network_failures}
 
+Warnings (may be legitimate; use judgement):
+{warnings}
+
 Detected Evidence:
 {evidence}
 
-Evaluate whether this constitutes a bug or regression."""
+Evaluate whether this constitutes a bug or regression. Check every invariant against what the page \
+showed after each step, and whether the goal's expected outcome (confirmation, updated totals, \
+visible controls) actually happened."""
 
         messages = [
             {"role": "system", "content": SYSTEM_JUDGE_PROMPT},
@@ -223,13 +245,31 @@ Evaluate whether this constitutes a bug or regression."""
             )
 
     @staticmethod
+    def _describe_step(s) -> str:
+        line = (f"Step {s.step_number}: {s.action.action.value} on {s.action.target_id or s.action.selector or '-'}"
+                f" (value={s.action.value!r}) -> {'ok' if s.success else 'FAILED: ' + str(s.error_message)[:200]}")
+        if s.action.thought:
+            line += f"\n    Agent intent: {s.action.thought[:200]}"
+        for d in s.dialogs:
+            line += f"\n    Dialog: {d[:200]}"
+        for o in s.observations:
+            line += f"\n    Looks wrong: {o}"
+        if s.url_after != s.url_before:
+            line += f"\n    URL changed to: {s.url_after}"
+        if s.page_text_after:
+            line += f"\n    Page then showed: {s.page_text_after[:600]}"
+        return line
+
+    @staticmethod
     def _default_bug_type(run_result: FlowRunResult) -> BugType:
         return BugType.RUNTIME_CRASH if run_result.uncaught_errors else BugType.FUNCTIONAL_REGRESSION
 
     @staticmethod
     def _hard_failure(run_result: FlowRunResult) -> bool:
         """Evidence strong enough to fail the flow even if the model says PASS."""
-        if run_result.uncaught_errors or any(n.get("status", 0) >= 500 for n in run_result.network_failures):
+        if run_result.uncaught_errors or run_result.hard_findings:
+            return True
+        if any(n.get("status", 0) >= 500 for n in run_result.network_failures):
             return True
         return bool(RegressionJudge._broken_api_calls(run_result))
 

@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     action_timeout_ms: int = 10_000
     navigation_timeout_ms: int = 30_000
     max_steps_per_flow: int = 25
+    flow_timeout_seconds: int = 300
+    # Failed flows are re-run once so the report can say whether the bug reproduced.
+    rerun_failures: bool = True
 
     # ── Output ─────────────────────────────────────────────────────────
     output_dir: Path = Path("./diffqa_output")

@@ -57,3 +57,9 @@ class ExecutionStep(BaseModel):
     success: bool = True
     error_message: Optional[str] = None
     duration_ms: float = 0.0
+    # What a tester would notice after the action: alert/confirm text, what the page now says,
+    # which controls are present, and anything that looks wrong at a glance.
+    dialogs: List[str] = Field(default_factory=list)
+    page_text_after: str = ""
+    elements_after: List[str] = Field(default_factory=list)
+    observations: List[str] = Field(default_factory=list)
