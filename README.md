@@ -1,4 +1,4 @@
-# DiffQA 🚀
+# DiffQA 
 
 > **Autonomous QA Agent that tests web apps like an expert human tester after every PR code change.**  
 > Built for the **Meta Global AI Developer Hackathon 2026** (Indie Developer Track).
