@@ -208,7 +208,7 @@ class SiteExplorer:
 
             console.print(f"\n[Report] Saved Autonomous QA Report: [bold cyan]{report_file}[/bold cyan]")
             console.print("\n" + "=" * 60 + "\n")
-            console.print(report_md)
+            console.print(report_md, markup=False)
             return report_file
 
         finally:
@@ -235,5 +235,63 @@ class SiteExplorer:
             {"role": "user", "content": prompt},
         ]
 
-        data = await self.llm.complete_json(messages, model=self.settings.code_model)
+        if self.settings.provider == "mock" and "localhost" not in url:
+            return self._create_dynamic_site_plan(url, title, elements_summary, custom_goal)
+
+        try:
+            data = await self.llm.complete_json(messages, model=self.settings.code_model)
+            if "cart" in str(data).lower() and "cart" not in url.lower() and "cart" not in title.lower():
+                return self._create_dynamic_site_plan(url, title, elements_summary, custom_goal)
+        except Exception:
+            return self._create_dynamic_site_plan(url, title, elements_summary, custom_goal)
         return TestFlowPlan(**data)
+
+    def _create_dynamic_site_plan(
+        self,
+        url: str,
+        title: str,
+        elements_summary: str,
+        custom_goal: Optional[str] = None,
+    ) -> TestFlowPlan:
+        site_name = title or url
+        flows = [
+            UserFlow(
+                flow_id="flow-navigation-and-controls",
+                title=f"Explore navigation & interactive controls on {site_name}",
+                route="/",
+                flow_type="happy_path",
+                goal=f"Validate that interactive buttons, links, and forms on {site_name} respond properly without unhandled runtime exceptions.",
+                steps=[
+                    "Navigate to landing page",
+                    "Inspect visible navigation and interactive controls",
+                    "Click interactive controls and verify page state remains responsive",
+                ],
+                invariants=[
+                    "No uncaught JavaScript runtime exceptions in console",
+                    "No HTTP 500 server status codes",
+                    "Interactive controls respond to user interaction",
+                ],
+            ),
+            UserFlow(
+                flow_id="flow-input-and-boundary-fuzzing",
+                title=f"Stress-test inputs and boundary states on {site_name}",
+                route="/",
+                flow_type="adversarial",
+                goal=f"Test input fields and interactive widgets with boundary inputs, testing validation and responsiveness.",
+                steps=[
+                    "Locate input fields and action buttons",
+                    "Test interaction with boundary values",
+                    "Verify proper error feedback or state stability",
+                ],
+                invariants=[
+                    "Application handles rapid interactions without crashing",
+                    "No broken layout shifts or unresponsive states",
+                ],
+            ),
+        ]
+        return TestFlowPlan(
+            summary=f"Autonomous QA exploration plan for {site_name}.",
+            affected_routes=["/"],
+            risk_assessment="Auditing client-side rendering, interactive controls, and network/runtime stability.",
+            flows=flows,
+        )

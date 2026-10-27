@@ -39,3 +39,4 @@ class TestSuperhumanOracle:
         )
         assert report.quality_score == 55
         assert report.critical_issues == 1
+

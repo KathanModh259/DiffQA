@@ -50,3 +50,4 @@ class TestDashboardGenerator:
         gen.save_dashboard(html, save_file)
         assert save_file.exists()
         assert len(save_file.read_text(encoding="utf-8")) > 500
+

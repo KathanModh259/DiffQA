@@ -13,3 +13,4 @@ services:
       - BASETEN_API_KEY=${BASETEN_API_KEY:-}
       - MODAL_API_KEY=${MODAL_API_KEY:-}
     command: ["demo", "--headless"]
+

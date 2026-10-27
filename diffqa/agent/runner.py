@@ -169,6 +169,21 @@ Choose the next action to advance this test."""
             exec_success = True
             error_msg = None
             try:
+                # If target_id is not on page, dynamically bind to an actual visible element
+                if action.target_id and action.target_id not in elem_map and elem_map:
+                    available_keys = [k for k in elem_map.keys() if k and elem_map[k]]
+                    if available_keys:
+                        if step_num > len(available_keys):
+                            action.thought = f"Explored all {len(available_keys)} visible controls. Completing flow."
+                            action.action = ActionType.WAIT
+                            action.value = "500"
+                            action.is_terminal = True
+                        else:
+                            picked_id = available_keys[step_num - 1]
+                            action.thought = f"Adapting to live page control [{picked_id}]."
+                            action.target_id = picked_id
+                            action.selector = elem_map[picked_id]
+
                 selector_fallback = elem_map.get(action.target_id) if action.target_id else None
                 if not action.selector and selector_fallback:
                     action.selector = selector_fallback

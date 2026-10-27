@@ -32,3 +32,4 @@ ENV HEADLESS=true
 # Entrypoint
 ENTRYPOINT ["diffqa"]
 CMD ["demo", "--headless"]
+

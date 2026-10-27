@@ -104,3 +104,4 @@ class AdversarialFuzzer:
         except Exception as e:
             logger.warning(f"Rapid click failure on {selector}: {e}")
             return False
+

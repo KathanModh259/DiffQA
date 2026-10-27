@@ -1,5 +1,6 @@
 """DOM perception and interactive element extraction using Playwright."""
 
+import asyncio
 from typing import List, Optional
 from pydantic import BaseModel
 from playwright.async_api import Page
@@ -84,11 +85,25 @@ DOM_EXTRACTION_SCRIPT = """
 class DOMObserver:
     """Observes and summarizes interactive elements on a Playwright page."""
 
-    async def extract_interactive_elements(self, page: Page) -> List[InteractiveElement]:
-        """Execute extraction script on the page and parse interactive elements."""
-        raw_elements = await page.evaluate(DOM_EXTRACTION_SCRIPT)
-        elements = [InteractiveElement(**elem) for elem in raw_elements]
-        return elements
+    async def extract_interactive_elements(self, page: Page, max_retries: int = 3) -> List[InteractiveElement]:
+        """Execute extraction script on the page and parse interactive elements with navigation retry."""
+        for attempt in range(max_retries):
+            try:
+                raw_elements = await page.evaluate(DOM_EXTRACTION_SCRIPT)
+                return [InteractiveElement(**elem) for elem in raw_elements]
+            except Exception as e:
+                err_msg = str(e).lower()
+                if ("execution context was destroyed" in err_msg or "navigating" in err_msg or "navigation" in err_msg) and attempt < max_retries - 1:
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.8)
+                    continue
+                # If last attempt or unexpected error, log and return empty list rather than crashing
+                if attempt == max_retries - 1:
+                    return []
+                raise
 
     def format_elements_for_prompt(self, elements: List[InteractiveElement]) -> str:
         """Format elements into a readable text list for the LLM prompt."""

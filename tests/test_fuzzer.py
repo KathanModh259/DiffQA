@@ -20,3 +20,4 @@ class TestAdversarialFuzzer:
 
         rtl = [p for p in FUZZ_PAYLOADS if p.name == "rtl_arabic"][0]
         assert len(rtl.value) > 0
+

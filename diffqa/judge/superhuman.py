@@ -195,3 +195,4 @@ class SuperhumanOracle:
             network_anomalies=network_errors,
             unhandled_errors=console_errors,
         )
+

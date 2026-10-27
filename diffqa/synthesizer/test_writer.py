@@ -108,7 +108,7 @@ class PlaywrightTestSynthesizer:
             selector = s.action.selector
             if not selector and s.action.target_id:
                 selector = f"[data-diffqa-id='{s.action.target_id}']"
-            if not selector:
+            if not selector or not str(selector).strip():
                 selector = "body"
 
             formatted_steps.append({
@@ -156,7 +156,7 @@ class PlaywrightTestSynthesizer:
             selector = s.action.selector
             if not selector and s.action.target_id:
                 selector = f"[data-diffqa-id='{s.action.target_id}']"
-            if not selector:
+            if not selector or not str(selector).strip():
                 selector = "body"
 
             formatted_steps.append({

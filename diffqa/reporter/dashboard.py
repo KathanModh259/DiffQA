@@ -221,3 +221,4 @@ class DashboardGenerator:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(html_content, encoding="utf-8")
         return path
+
