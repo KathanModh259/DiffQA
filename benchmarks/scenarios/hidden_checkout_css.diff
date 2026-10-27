@@ -1,0 +1,7 @@
+diff --git a/benchmarks/testbed_app/index.html b/benchmarks/testbed_app/index.html
+--- a/benchmarks/testbed_app/index.html
++++ b/benchmarks/testbed_app/index.html
+@@ -55,6 +55,7 @@
+     .checkout-form { margin-top: 1.5rem; display: flex; flex-direction: column; gap: 1rem; }
++    #btn-checkout { display: none !important; }
+

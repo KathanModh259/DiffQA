@@ -1,0 +1,15 @@
+diff --git a/benchmarks/testbed_app/index.html b/benchmarks/testbed_app/index.html
+--- a/benchmarks/testbed_app/index.html
++++ b/benchmarks/testbed_app/index.html
+@@ -215,8 +215,10 @@
+     function applyPromo() {
+-      const code = document.getElementById('promo-code').value.trim();
+-      const err = document.getElementById('promo-error');
+-      if (code === 'META2026') {
++      const raw = document.getElementById('promo-code').value;
++      // Unchecked split causes TypeError if promo is empty or has no hyphen
++      const parts = raw.split("-");
++      const code = parts[1].toUpperCase();
++      if (code === 'META2026') {
+         err.style.display = 'none';
+

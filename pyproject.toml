@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffqa"
+version = "0.1.0"
+description = "Autonomous PR Regression Testing Agent powered by Meta Models & Playwright"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Kathan Modh", email = "kathanmodh@gmail.com" }
+]
+keywords = ["qa", "agent", "playwright", "testing", "llm", "diff", "regression", "meta"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "playwright>=1.42.0",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "typer>=0.9.0",
+    "rich>=13.7.0",
+    "httpx>=0.27.0",
+    "unidiff>=0.7.5",
+    "jinja2>=3.1.3",
+    "pillow>=10.2.0",
+    "python-dotenv>=1.0.1"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "black>=24.0.0",
+    "ruff>=0.3.0"
+]
+
+[project.scripts]
+diffqa = "diffqa.cli:app"
