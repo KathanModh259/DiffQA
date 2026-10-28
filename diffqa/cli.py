@@ -84,13 +84,18 @@ def run(
     headless: bool = typer.Option(True, "--headless/--headed", help="Run browser in headless mode"),
     viewport: str = typer.Option("desktop", "--viewport", help="desktop (1280x800) or mobile (390x844)"),
     rerun: bool = typer.Option(True, "--rerun/--no-rerun", help="Re-run failed flows once to confirm they reproduce"),
+    base_url: Optional[str] = typer.Option(
+        None, "--base-url",
+        help="URL of the app before this change (e.g. production). Failures that also happen there are "
+             "reported as pre-existing and don't fail the run.",
+    ),
 ):
     """Execute DiffQA: parse diff, run autonomous browser flows, judge regressions, and synthesize tests.
 
-    Exits with status 1 when any flow fails, so it can gate CI.
+    Exits with status 1 when any flow fails because of this change, so it can gate CI.
     """
     settings = _settings(provider, headless, output, viewport, rerun)
-    failed = asyncio.run(_run_pipeline(diff, url, settings))
+    failed = asyncio.run(_run_pipeline(diff, url, settings, base_url))
     raise typer.Exit(code=1 if failed else 0)
 
 
@@ -107,8 +112,8 @@ def _settings(provider: str, headless: bool, output: Path, viewport: str = "desk
     )
 
 
-async def _run_pipeline(diff_path: Path, url: str, settings: Settings) -> int:
-    """Run the full pipeline and return the number of failed flows."""
+async def _run_pipeline(diff_path: Path, url: str, settings: Settings, base_url: Optional[str] = None) -> int:
+    """Run the full pipeline and return the number of flows this change broke."""
     output_dir, provider = settings.output_dir, settings.provider
     llm = LLMClient(settings=settings)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -137,7 +142,7 @@ async def _run_pipeline(diff_path: Path, url: str, settings: Settings) -> int:
             plan = await FlowPlanner(llm_client=llm).plan_flows(parsed_diff, preview_url=url)
         console.print(f"Generated [bold]{len(plan.flows)}[/bold] test flows.")
 
-        report_items = await execute_plan(plan, url, controller, llm, settings, output_dir)
+        report_items = await execute_plan(plan, url, controller, llm, settings, output_dir, compare_url=base_url)
     finally:
         await controller.close()
 
@@ -154,7 +159,7 @@ async def _run_pipeline(diff_path: Path, url: str, settings: Settings) -> int:
     console.print(f"Saved Interactive Dashboard: [bold yellow]{dash_path}[/bold yellow]")
     console.rule()
     console.print(Markdown(report_md))
-    return sum(1 for i in report_items if not i.passed)
+    return sum(1 for i in report_items if i.blocks_merge)
 
 
 @app.command()

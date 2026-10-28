@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 from diffqa.analyzer.flow_planner import TestFlowPlan
 from diffqa.judge.superhuman import SuperhumanAuditReport
-from diffqa.reporter.markdown import AUTOMATIC_CHECKS, FlowReportItem, reproduction_note
+from diffqa.reporter.markdown import AUTOMATIC_CHECKS, FlowReportItem, baseline_note, reproduction_note
 
 MAX_EMBEDDED_PNG = 2_000_000  # keep the single-file dashboard openable
 
@@ -116,7 +116,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
           <tr>
             <td>
               <span class="badge {{ 'badge-pass' if item.passed else 'badge-fail' }}">
-                {{ 'PASS' if item.passed else ('NOT TESTED' if item.verdict.verdict == 'ERROR' else 'FAIL') }}
+                {{ 'PASS' if item.passed else ('NOT TESTED' if item.verdict.verdict == 'ERROR' else ('ALREADY BROKEN' if item.verdict.pre_existing else 'FAIL')) }}
               </span>
             </td>
             <td><b>{{ item.title }}</b></td>
@@ -130,7 +130,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <!-- Regressions & Synthesized Specs -->
-    {% if failed_count > 0 %}
+    {% if items|rejectattr('passed')|list %}
     <div class="card" style="border-left: 4px solid var(--danger);">
       <div class="card-title" style="color: var(--danger);">🚨 Regressions & Auto-Synthesized Playwright Specs</div>
       {% for item in items %}
@@ -141,7 +141,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
           Severity: <span class="badge badge-crit">{{ item.verdict.severity.value if item.verdict.severity else 'HIGH' }}</span> |
           Confidence: <b>{{ (item.verdict.confidence * 100)|int }}%</b>
         </p>
-        <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 0.75rem;">{{ reproduction_note(item.verdict) }}</p>
+        <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 0.75rem;">{{ reproduction_note(item.verdict) }}{% if baseline_note(item.verdict) %}. {{ baseline_note(item.verdict) }}{% endif %}</p>
         {% if item.verdict.root_cause_hypothesis %}
         <p style="margin-bottom: 0.75rem;"><b>Root Cause Hypothesis:</b> {{ item.verdict.root_cause_hypothesis }}</p>
         {% endif %}
@@ -240,7 +240,7 @@ class DashboardGenerator:
         from jinja2 import Template
 
         passed_count = sum(1 for i in items if i.passed)
-        failed_count = sum(1 for i in items if not i.passed)
+        failed_count = sum(1 for i in items if i.blocks_merge)
         specs_count = sum(1 for i in items if i.spec_code_ts)
         quality_score = audit.quality_score if audit else (100 if failed_count == 0 else max(20, 100 - failed_count * 25))
 
@@ -255,6 +255,7 @@ class DashboardGenerator:
         return tmpl.render(
             screenshots=screenshots,
             reproduction_note=reproduction_note,
+            baseline_note=baseline_note,
             automatic_checks=AUTOMATIC_CHECKS,
             preview_url=preview_url,
             plan=plan,

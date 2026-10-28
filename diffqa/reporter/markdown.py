@@ -21,6 +21,11 @@ class FlowReportItem(BaseModel):
     assertions_count: int = 0
     invariants: List[str] = Field(default_factory=list)
 
+    @property
+    def blocks_merge(self) -> bool:
+        """A failure this change is responsible for (or could not rule out). Pre-existing bugs are reported, not blocking."""
+        return not self.passed and not self.verdict.pre_existing
+
 
 # Checks applied to every flow regardless of model, listed in reports so readers know what was covered.
 AUTOMATIC_CHECKS = [
@@ -41,6 +46,14 @@ def reproduction_note(v: JudgeVerdict) -> str:
     return "Observed once (re-run disabled)"
 
 
+def baseline_note(v: JudgeVerdict) -> str:
+    if v.pre_existing is True:
+        return "Also fails on the base version: already broken before this change"
+    if v.pre_existing is False:
+        return "Passes on the base version: introduced by this change"
+    return ""
+
+
 class PRReportGenerator:
     """Renders structured Markdown suitable for GitHub PR comments."""
 
@@ -51,9 +64,8 @@ class PRReportGenerator:
         preview_url: str = "",
         commit_sha: Optional[str] = None,
     ) -> str:
-        sum(1 for item in items if item.passed)
-        failed_count = sum(1 for item in items if not item.passed)
-        len(items)
+        failed_count = sum(1 for item in items if item.blocks_merge)
+        flagged = [item for item in items if not item.passed]
 
         status_badge = (
             "![Status](https://img.shields.io/badge/DiffQA-PASSED-brightgreen)"
@@ -73,18 +85,19 @@ class PRReportGenerator:
         md.append("| Status | Flow | Route | Type | Duration |")
         md.append("| :---: | :--- | :--- | :---: | :---: |")
         for item in items:
-            badge = "✅ Pass" if item.passed else ("⚠️ Not tested" if item.verdict.verdict == "ERROR" else "❌ Fail")
+            badge = ("✅ Pass" if item.passed else "⚠️ Not tested" if item.verdict.verdict == "ERROR"
+                     else "🟡 Already broken" if item.verdict.pre_existing else "❌ Fail")
             type_badge = f"`{item.flow_type}`"
             md.append(f"| {badge} | **{item.title}** | `{item.route}` | {type_badge} | {item.duration_seconds:.1f}s |")
         md.append("\n---\n")
 
         # Bug Details Section if failures exist
-        if failed_count > 0:
-            md.append("### 🚨 Detected Regressions & Reproduction Steps\n")
-            for item in items:
-                if item.passed:
-                    continue
-
+        if failed_count == 0:
+            md.append("### ✅ All planned flows passed with no regressions\n")
+        if flagged:
+            md.append("### 🚨 Detected Regressions & Reproduction Steps\n" if failed_count else
+                      "### 🟡 Issues that already existed before this change\n")
+            for item in flagged:
                 v = item.verdict
                 severity_tag = f"**Severity: `{v.severity.value if v.severity else 'HIGH'}`**"
 
@@ -94,9 +107,11 @@ class PRReportGenerator:
                     md.append("\n---\n")
                     continue
 
-                md.append(f"#### ❌ {v.title or item.title}")
+                md.append(f"#### {'🟡 Already broken: ' if v.pre_existing else '❌ '}{v.title or item.title}")
                 md.append(f"- {severity_tag} | Flow: `{item.flow_id}` | Confidence: `{int(v.confidence * 100)}%`")
                 md.append(f"- **Reproduction:** {reproduction_note(v)}")
+                if baseline_note(v):
+                    md.append(f"- **Base version:** {baseline_note(v)}")
                 if v.root_cause_hypothesis:
                     md.append(f"- **Root Cause Hypothesis:** {v.root_cause_hypothesis}")
                 if v.screenshot_evidence:
@@ -120,8 +135,6 @@ class PRReportGenerator:
                     md.append("</details>\n")
 
                 md.append("\n---\n")
-        else:
-            md.append("### ✅ All planned flows passed with no regressions\n")
 
         # What was actually covered, so a reader can judge the result rather than trust it blindly.
         md.append("<details><summary><b>🔍 Coverage: what this run checked</b></summary>\n")

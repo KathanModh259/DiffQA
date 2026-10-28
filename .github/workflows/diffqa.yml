@@ -38,7 +38,7 @@ jobs:
         env:
           MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
         # Exits 1 when a regression is found, failing this job.
-        run: diffqa run --diff pr.diff --url "${{ vars.DIFFQA_PREVIEW_URL }}" --provider meta --output ./diffqa_output
+        run: diffqa run --diff pr.diff --url "${{ vars.DIFFQA_PREVIEW_URL }}" --provider meta --output ./diffqa_output ${{ vars.DIFFQA_BASE_URL && format('--base-url "{0}"', vars.DIFFQA_BASE_URL) || '' }}
 
       - name: Upload screenshots, specs and dashboard
         if: always()

@@ -98,17 +98,27 @@ class BenchmarkRunner:
             site_dir.mkdir()
             build_testbed(diff_path, site_dir)
             server, url = serve_in_background(site_dir)
+            servers = [server]
+            compare_url = None
+            if diff_path:
+                # The unpatched store plays "production": failures it shares are not this diff's fault.
+                base_dir = Path(tmp) / "base"
+                base_dir.mkdir()
+                build_testbed(None, base_dir)
+                base_server, compare_url = serve_in_background(base_dir)
+                servers.append(base_server)
             controller = BrowserController(settings=self.settings)
             try:
                 plan = await FlowPlanner(llm_client=self.llm).plan_flows(parsed, preview_url=url)
                 await controller.start()
-                items = await execute_plan(plan, url, controller, self.llm, self.settings, out_dir)
+                items = await execute_plan(plan, url, controller, self.llm, self.settings, out_dir, compare_url=compare_url)
             finally:
                 await controller.close()
-                server.shutdown()
-                server.server_close()
+                for s in servers:
+                    s.shutdown()
+                    s.server_close()
 
-        failed: List[FlowReportItem] = [i for i in items if not i.passed]
+        failed: List[FlowReportItem] = [i for i in items if i.blocks_merge]
         first = failed[0].verdict if failed else None
         return ScenarioResult(
             scenario_name=name,

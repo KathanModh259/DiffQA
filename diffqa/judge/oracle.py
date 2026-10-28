@@ -42,6 +42,8 @@ class JudgeVerdict(BaseModel):
     screenshot_evidence: Optional[str] = None
     # Filled by the pipeline after re-running a failed flow: True = failed again, False = passed on retry.
     reproduced: Optional[bool] = None
+    # Filled when a base (pre-change) URL is given: True = the flow fails there too, so this PR didn't cause it.
+    pre_existing: Optional[bool] = None
 
     # Model output is loose ("high", "95%", "Runtime Crash"); coerce rather than discard the verdict.
     @field_validator("severity", mode="before")

@@ -210,6 +210,43 @@ class TestRerunToConfirm:
         assert "intermittent" in reproduction_note(items[0].verdict)
 
 
+class TestBaseComparison:
+
+    async def _run(self, tmp_path, monkeypatch, base_fails):
+        urls = []
+
+        async def fake_run_flow(self, flow, base_url, artifacts_dir=None):
+            urls.append(base_url)
+            return FlowRunResult(flow=flow)
+
+        async def fake_judge(self, result):
+            broken = urls[-1] == "http://head" or base_fails
+            return JudgeVerdict(flow_id="f1", passed=not broken, verdict="FAIL" if broken else "PASS", title="Cart resets")
+
+        monkeypatch.setattr(BrowserAgentRunner, "run_flow", fake_run_flow)
+        monkeypatch.setattr(RegressionJudge, "judge_flow", fake_judge)
+        plan = TestFlowPlan(flows=[UserFlow(flow_id="f1")])
+        items = await execute_plan(plan, "http://head", None, None, Settings(provider="mock", rerun_failures=False),
+                                   tmp_path, compare_url="http://base")
+        assert urls == ["http://head", "http://base"]
+        return items[0], PRReportGenerator().generate_report(plan, items)
+
+    @pytest.mark.asyncio
+    async def test_failure_also_on_base_is_pre_existing_and_does_not_block(self, tmp_path, monkeypatch):
+        item, md = await self._run(tmp_path, monkeypatch, base_fails=True)
+        assert item.verdict.pre_existing is True and not item.blocks_merge
+        assert "Already broken: Cart resets" in md
+        assert "All planned flows passed with no regressions" in md
+        assert "Issues that already existed before this change" in md
+
+    @pytest.mark.asyncio
+    async def test_failure_only_on_head_is_blamed_on_the_change(self, tmp_path, monkeypatch):
+        item, md = await self._run(tmp_path, monkeypatch, base_fails=False)
+        assert item.verdict.pre_existing is False and item.blocks_merge
+        assert "introduced by this change" in md
+        assert "1%20FAILED" in md
+
+
 class TestEvidenceInReports:
 
     def _item(self, tmp_path):

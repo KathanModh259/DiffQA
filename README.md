@@ -182,6 +182,7 @@ DIFFQA_PROVIDER=mock
 | `diffqa serve --port 3000` | Starts the QuickShop testbed web application locally. |
 | `diffqa doctor` | Verifies Python, Chromium, provider credentials and a live model call. Run this first. |
 | `diffqa run ... --viewport mobile` | Runs the same flows at a 390×844 phone viewport. |
+| `diffqa run ... --base-url https://prod.example.com` | Re-tries each failure on the app before the change. Failures that happen there too are reported as "already broken" and don't fail the run. |
 | `diffqa audit <url>` | **Superhuman Invariant Audit**: catches layout overflow, text clipping, broken assets, WCAG a11y violations, and network errors. Generates interactive HTML dashboard. |
 | `python -m pytest` | Runs unit tests plus real-browser end-to-end tests (skipped if Chromium is not installed). |
 
@@ -310,7 +311,7 @@ Other OpenAI-compatible hosts (Fireworks, Baseten, Modal serving Muse Spark Open
 **Reliability:** rate limits (429), 5xx and network errors are retried with exponential backoff; a reply that isn't JSON gets one repair request; loosely formatted model output (`"severity": "high"`, `"action": "type"`) is normalised rather than rejected. If DiffQA can't test a flow (preview unreachable, model down) the flow is reported as **Not tested**, never as an app bug, and the run still fails so CI stays red.
 
 ### CI setup
-Add the repository secret `MODEL_API_KEY` and the variable `DIFFQA_PREVIEW_URL` (your PR preview deployment). [`.github/workflows/diffqa.yml`](.github/workflows/diffqa.yml) then runs on every PR, comments the report, uploads screenshots/specs, and fails the check on regressions.
+Add the repository secret `MODEL_API_KEY` and the variable `DIFFQA_PREVIEW_URL` (your PR preview deployment). [`.github/workflows/diffqa.yml`](.github/workflows/diffqa.yml) then runs on every PR, comments the report, uploads screenshots/specs, and fails the check on regressions. Optionally set the variable `DIFFQA_BASE_URL` to your production or main-branch deployment, so bugs that were already there are labelled "already broken" instead of failing the PR.
 
 --- | :--- | :--- |
 | **Diff & AST Analysis** | `meta/muse-code` / `Llama-3.3-70B` | Reads code diffs, identifies modified endpoints/components, and designs happy/adversarial test journeys. |

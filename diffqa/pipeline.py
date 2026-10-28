@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from rich.console import Console
 
@@ -27,7 +27,11 @@ async def execute_plan(
     llm: LLMClient,
     settings: Settings,
     output_dir: Path,
+    compare_url: Optional[str] = None,
 ) -> List[FlowReportItem]:
+    """Run, judge and report each flow. With ``compare_url`` (the app before this change), every
+    failure is also tried there: if it fails there too, it is labelled pre-existing instead of
+    blamed on the change."""
     runner = BrowserAgentRunner(controller=controller, llm_client=llm, settings=settings)
     judge = RegressionJudge(llm_client=llm, settings=settings)
     synthesizer = PlaywrightTestSynthesizer()
@@ -57,6 +61,18 @@ async def execute_plan(
                 logger.warning("Re-run of %s crashed: %s", flow.flow_id, e)
                 await controller.recover()
 
+        if not verdict.passed and verdict.verdict != "ERROR" and compare_url:
+            console.print("  [yellow]Checking whether the base version has the same problem...[/yellow]")
+            try:
+                base = await runner.run_flow(flow, base_url=compare_url, artifacts_dir=output_dir / f"{flow.flow_id}-base")
+                base_verdict = await judge.judge_flow(base)
+                # A base run that couldn't test (ERROR) proves nothing either way: leave it unknown.
+                if base_verdict.verdict != "ERROR":
+                    verdict.pre_existing = not base_verdict.passed
+            except Exception as e:
+                logger.warning("Base run of %s crashed: %s", flow.flow_id, e)
+                await controller.recover()
+
         spec_ts = None
         if verdict.passed:
             console.print("  [bold green]PASSED[/bold green]")
@@ -64,6 +80,7 @@ async def execute_plan(
             console.print(f"  [bold yellow]NOT TESTED:[/bold yellow] {verdict.title}")
         else:
             repro = {True: " (reproduced on re-run)", False: " (did not reproduce on re-run: intermittent)"}.get(verdict.reproduced, "")
+            repro += {True: " [already broken before this change]", False: " [introduced by this change]"}.get(verdict.pre_existing, "")
             console.print(f"  [bold red]FAILED:[/bold red] {verdict.title}{repro}")
             spec_path = output_dir / "specs" / f"{flow.flow_id}.spec.ts"
             spec_ts = synthesizer.synthesize_typescript(
