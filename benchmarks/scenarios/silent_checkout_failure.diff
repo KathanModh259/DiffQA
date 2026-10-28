@@ -8,6 +8,8 @@ diff --git a/benchmarks/testbed_app/index.html b/benchmarks/testbed_app/index.ht
 -        return;
 -      }
 -      alert('Order placed successfully! Thank you for testing with DiffQA.');
+-      cart = [];
+-      renderCart();
 +      // Simplified checkout — just clear cart
 +      cart = [];
 +      renderCart();

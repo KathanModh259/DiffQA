@@ -98,6 +98,12 @@ Design:
 3. **Invariants** — clear, observable assertions that must hold
    (e.g. "Subtotal == sum(items)", "No uncaught JS error").
 
+The diff is the change under test, not the specification: it may be the bug.
+Never plan a flow whose goal is to confirm the change itself (e.g. "verify the
+button is hidden"). State every goal from the user's side ("customer adds an
+item and completes checkout") and include at least one flow for each core
+journey the changed code touches, so a change that breaks that journey fails.
+
 Reply with **valid JSON only** matching this schema:
 {
   "summary": "...",
