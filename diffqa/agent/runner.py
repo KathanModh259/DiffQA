@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
-from diffqa.agent.actions import AgentAction, ExecutionStep
+from diffqa.agent.actions import ActionType, AgentAction, ExecutionStep
 from diffqa.agent.browser import BrowserController
 from diffqa.agent.dom_observer import DOMObserver
 from diffqa.analyzer.flow_planner import UserFlow
@@ -136,6 +136,7 @@ class BrowserAgentRunner:
         step_num = 0
         terminal_reached = False
         llm_failures = 0
+        failed_actions: Dict[tuple, str] = {}
         site_host = urlparse(initial_url).netloc
 
         while step_num < self.settings.max_steps_per_flow:
@@ -213,10 +214,15 @@ Choose the next action to advance this test."""
                 # A hallucinated target_id fails loudly; the error shows up in the next prompt's history.
                 if not action.selector and action.target_id:
                     action.selector = elem_map.get(action.target_id) or f"[data-diffqa-id='{action.target_id}']"
+                # Retrying an identical failed click just burns another full timeout; fail it instantly.
+                key = (action.action, action.selector, action.value)
+                if key in failed_actions and action.action != ActionType.ASSERT:
+                    raise RuntimeError(f"Skipped: identical action already failed ({failed_actions[key][:120]})")
                 await self.controller.execute_action(action)
             except Exception as e:
                 exec_success = False
                 error_msg = str(e).split("\n")[0][:300]
+                failed_actions.setdefault((action.action, action.selector, action.value), error_msg)
                 logger.warning(f"Action execution failed on step {step_num}: {error_msg}")
 
             # Keep the agent on the site under test (external links, OAuth popups in the main tab, ads).

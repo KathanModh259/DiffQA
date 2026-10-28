@@ -123,6 +123,31 @@ async def test_failed_assertion_is_evidence(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_repeated_failed_click_is_skipped_without_waiting(tmp_path):
+    # The checkout button starts disabled (empty cart), so clicking it times out.
+    click = {"action": "click", "target_id": "btn-checkout"}
+    result, _, _ = await _run_scripted(tmp_path, None, [click, click])
+    assert result.steps[0].success is False
+    assert result.steps[1].error_message.startswith("Skipped: identical action already failed")
+    assert result.steps[1].duration_ms < 5000
+
+
+@pytest.mark.asyncio
+async def test_javascript_urls_are_refused(tmp_path):
+    actions = [{"action": "navigate", "value": "javascript:document.body.innerHTML=''"}]
+    result, _, _ = await _run_scripted(tmp_path, None, actions)
+    assert "non-http(s) URL" in result.steps[0].error_message
+
+
+@pytest.mark.asyncio
+async def test_assertion_matches_text_split_across_elements(tmp_path):
+    # "Subtotal:" and "$0.00" are separate flex children; a person reads them as one line.
+    actions = [{"action": "assert", "value": "Subtotal: $0.00"}]
+    result, _, _ = await _run_scripted(tmp_path, None, actions)
+    assert result.steps[0].success is True, result.steps[0].error_message
+
+
+@pytest.mark.asyncio
 async def test_passing_assertion_and_missing_control_visible_to_judge(tmp_path):
     actions = [
         {"action": "click", "target_id": "btn-add-to-cart-1"},

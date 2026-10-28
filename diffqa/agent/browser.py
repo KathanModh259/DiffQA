@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from typing import Any, Dict, List, Optional
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
@@ -10,6 +10,10 @@ from diffqa.agent.actions import AgentAction, ActionType
 from diffqa.config import Settings, get_settings
 
 logger = logging.getLogger("diffqa.browser")
+
+
+def _normalize_text(text: str) -> str:
+    return " ".join(text.split()).casefold()
 
 
 def _to_int(value: Optional[str], default: int) -> int:
@@ -152,7 +156,11 @@ class BrowserController:
 
         if action.action == ActionType.NAVIGATE:
             if action.value:
-                await self.navigate(urljoin(self.page.url, action.value))
+                target = urljoin(self.page.url, action.value)
+                # Models sometimes try javascript: or data: URLs to poke the DOM; a tester uses the UI.
+                if urlparse(target).scheme not in ("http", "https"):
+                    raise ValueError(f"Refusing to navigate to non-http(s) URL: {action.value[:80]}")
+                await self.navigate(target)
         elif action.action == ActionType.CLICK:
             if not target_selector:
                 raise ValueError("Target selector or target_id required for click action.")
@@ -181,8 +189,10 @@ class BrowserController:
                 if not await self.page.locator(target_selector).first.is_visible():
                     raise AssertionError(f"Assertion failed: element {target_selector} is not visible")
             elif action.value:
-                body = await self.page.inner_text("body")
-                if action.value.lower() not in body.lower():
+                # Compare as a person reads: "Subtotal:" and "$0.00" in separate flex children come back
+                # from inner_text as "Subtotal:\n$0.00", which must still match "Subtotal: $0.00".
+                body = _normalize_text(await self.page.inner_text("body"))
+                if _normalize_text(action.value) not in body:
                     raise AssertionError(f"Assertion failed: expected text not on page: {action.value!r}")
 
     async def page_text(self, limit: int) -> str:
