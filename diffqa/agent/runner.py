@@ -3,7 +3,7 @@
 import logging
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
@@ -63,7 +63,7 @@ If the flow goal has been accomplished, or an unrecoverable failure occurs, set 
 Supported actions:
 - `click`: Click on an element by target_id or selector.
 - `fill`: Enter text into an input by target_id or selector, with value.
-- `navigate`: Navigate to a relative path or URL.
+- `navigate`: Go to a page the app links to (or one already visited). Guessed URLs are refused.
 - `scroll`: Scroll down or up (value in pixels, e.g. "300").
 - `press`: Press a keyboard key (e.g. "Enter", "Tab", "Escape").
 - `wait`: Pause for milliseconds (value e.g. "1000").
@@ -138,11 +138,15 @@ class BrowserAgentRunner:
         llm_failures = 0
         failed_actions: Dict[tuple, str] = {}
         site_host = urlparse(initial_url).netloc
+        # Pages a person could reach: where they started, where they've been, and what the app links to.
+        known_paths = {_path(initial_url)}
 
         while step_num < self.settings.max_steps_per_flow:
             step_num += 1
             step_start = time.time()
             url_before = self.controller.page.url
+            known_paths.add(_path(url_before))
+            known_paths.update(_path(h) for h in await self._links())
 
             # 1. Observe current page interactive DOM (capped: real pages can have thousands of controls)
             elements = await self.dom.extract_interactive_elements(self.controller.page)
@@ -218,6 +222,11 @@ Choose the next action to advance this test."""
                 key = (action.action, action.selector, action.value)
                 if key in failed_actions and action.action != ActionType.ASSERT:
                     raise RuntimeError(f"Skipped: identical action already failed ({failed_actions[key][:120]})")
+                # A guessed URL (e.g. /products on a one-page app) tests the model's imagination, not the app.
+                if action.action == ActionType.NAVIGATE and action.value:
+                    target = urljoin(url_before, action.value)
+                    if urlparse(target).scheme in ("http", "https") and _path(target) not in known_paths:
+                        raise ValueError(f"Not navigating to {action.value[:80]}: the app does not link there")
                 await self.controller.execute_action(action)
             except Exception as e:
                 exec_success = False
@@ -302,6 +311,17 @@ Choose the next action to advance this test."""
         if s.page_text_after:
             line += f"\n    Page now shows: {s.page_text_after[:400]}"
         return line
+
+    async def _links(self) -> List[str]:
+        try:
+            return await self.controller.page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+        except Exception:
+            return []
+
+
+def _path(url: str) -> str:
+    """Path without query/fragment, so /cart?x=1 and /cart#top count as the same page."""
+    return urlparse(url).path.rstrip("/") or "/"
 
 
 def _element_label(el) -> str:

@@ -140,6 +140,15 @@ async def test_javascript_urls_are_refused(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_guessed_urls_are_refused_but_start_page_is_allowed(tmp_path):
+    # The store is one page with no /products link; the demo server would just serve the homepage there.
+    actions = [{"action": "navigate", "value": "/products"}, {"action": "navigate", "value": "/"}]
+    result, _, _ = await _run_scripted(tmp_path, None, actions)
+    assert "the app does not link there" in result.steps[0].error_message
+    assert result.steps[1].success is True, result.steps[1].error_message
+
+
+@pytest.mark.asyncio
 async def test_assertion_matches_text_split_across_elements(tmp_path):
     # "Subtotal:" and "$0.00" are separate flex children; a person reads them as one line.
     actions = [{"action": "assert", "value": "Subtotal: $0.00"}]
