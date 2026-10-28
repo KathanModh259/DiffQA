@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from benchmarks.serve import serve_in_background
+from diffqa.agent.actions import AgentAction, ExecutionStep
 from diffqa.agent.browser import BrowserController
 from diffqa.agent.runner import BrowserAgentRunner, FlowRunResult
 from diffqa.agent.sanity import check_page_text
@@ -168,15 +169,20 @@ async def test_passing_assertion_and_missing_control_visible_to_judge(tmp_path):
     assert "Interactive controls present at the end:" in llm.judge_prompts[0]
 
 
+def _step(success=True, action="click"):
+    return ExecutionStep(step_number=1, action=AgentAction(action=action, target_id="b"), url_before="http://x",
+                         url_after="http://x", success=success)
+
+
 class TestRerunToConfirm:
 
     @pytest.mark.asyncio
     async def test_failure_is_rerun_and_marked(self, tmp_path, monkeypatch):
         runs = []
 
-        async def fake_run_flow(self, flow, base_url, artifacts_dir=None):
+        async def fake_run_flow(self, flow, base_url, artifacts_dir=None, script=None):
             runs.append(artifacts_dir.name)
-            return FlowRunResult(flow=flow, uncaught_errors=["TypeError: boom"], success=False)
+            return FlowRunResult(flow=flow, steps=[_step()], uncaught_errors=["TypeError: boom"], success=False)
 
         async def fake_judge(self, result):
             return JudgeVerdict(flow_id=result.flow.flow_id, passed=False, verdict="FAIL", title="boom")
@@ -194,8 +200,8 @@ class TestRerunToConfirm:
     async def test_intermittent_failure_lowers_confidence(self, tmp_path, monkeypatch):
         outcomes = iter([False, True])
 
-        async def fake_run_flow(self, flow, base_url, artifacts_dir=None):
-            return FlowRunResult(flow=flow)
+        async def fake_run_flow(self, flow, base_url, artifacts_dir=None, script=None):
+            return FlowRunResult(flow=flow, steps=[_step()])
 
         async def fake_judge(self, result):
             ok = next(outcomes)
@@ -215,9 +221,9 @@ class TestBaseComparison:
     async def _run(self, tmp_path, monkeypatch, base_fails):
         urls = []
 
-        async def fake_run_flow(self, flow, base_url, artifacts_dir=None):
+        async def fake_run_flow(self, flow, base_url, artifacts_dir=None, script=None):
             urls.append(base_url)
-            return FlowRunResult(flow=flow)
+            return FlowRunResult(flow=flow, steps=[_step()])
 
         async def fake_judge(self, result):
             broken = urls[-1] == "http://head" or base_fails
@@ -274,3 +280,54 @@ class TestEvidenceInReports:
         assert "2. Look at total" in html
         assert "Reproduced on re-run" in html
         assert "Coverage: what this run checked" in html
+
+
+@pytest.mark.asyncio
+async def test_base_replay_that_cannot_repeat_the_steps_stays_blocking(tmp_path, monkeypatch):
+    # e.g. the PR renamed a button: the replay on the base version can't click it, which proves nothing.
+    async def fake_run_flow(self, flow, base_url, artifacts_dir=None, script=None):
+        return FlowRunResult(flow=flow, steps=[_step(success=base_url != "http://base")])
+
+    async def fake_judge(self, result):
+        return JudgeVerdict(flow_id="f1", passed=False, verdict="FAIL", title="broken")
+
+    monkeypatch.setattr(BrowserAgentRunner, "run_flow", fake_run_flow)
+    monkeypatch.setattr(RegressionJudge, "judge_flow", fake_judge)
+    items = await execute_plan(TestFlowPlan(flows=[UserFlow(flow_id="f1")]), "http://head", None, None,
+                               Settings(provider="mock", rerun_failures=False), tmp_path, compare_url="http://base")
+    assert items[0].verdict.pre_existing is None
+    assert items[0].blocks_merge
+
+
+@pytest.mark.asyncio
+async def test_flow_stops_after_two_failed_assertions(tmp_path):
+    actions = [{"action": "assert", "value": "nope 1"}, {"action": "assert", "value": "nope 2"},
+               {"action": "click", "target_id": "btn-add-to-cart-1"}]
+    result, _, _ = await _run_scripted(tmp_path, None, actions)
+    assert len(result.steps) == 2
+
+
+@pytest.mark.asyncio
+async def test_replay_repeats_steps_without_agent_calls(tmp_path):
+    actions = [{"action": "click", "target_id": "btn-add-to-cart-1"}, {"action": "assert", "value": "Cart (1)"}]
+    first, _, _ = await _run_scripted(tmp_path, None, actions)
+
+    class NoAgent(ScriptedLLM):
+        async def complete_json(self, messages, model=None):
+            assert "Evaluate whether this constitutes" in messages[-1]["content"], "replay asked the agent model"
+            return await super().complete_json(messages, model)
+
+    site = tmp_path / "site"
+    settings = Settings(provider="mock", headless=True)
+    server, url = serve_in_background(site)
+    controller = BrowserController(settings=settings)
+    try:
+        await controller.start()
+        runner = BrowserAgentRunner(controller=controller, llm_client=NoAgent([]), settings=settings)
+        again = await runner.run_flow(first.flow, url, tmp_path / "replay", script=[s.action for s in first.steps])
+    finally:
+        await controller.close()
+        server.shutdown()
+        server.server_close()
+    assert [s.success for s in again.steps] == [s.success for s in first.steps]
+    assert all(s.success for s in again.steps)

@@ -48,30 +48,33 @@ async def execute_plan(
             await controller.recover()
         verdict = await judge.judge_flow(result)
 
-        if not verdict.passed and verdict.verdict != "ERROR" and settings.rerun_failures:
-            # A tester confirms a bug before reporting it. Re-run once and say whether it reproduced.
-            console.print("  [yellow]Failure observed; re-running the flow to confirm...[/yellow]")
-            try:
-                second = await runner.run_flow(flow, base_url=base_url, artifacts_dir=output_dir / f"{flow.flow_id}-rerun")
-                second_verdict = await judge.judge_flow(second)
-                verdict.reproduced = not second_verdict.passed and second_verdict.verdict != "ERROR"
-                if not verdict.reproduced:
-                    verdict.confidence = min(verdict.confidence, 0.5)
-            except Exception as e:
-                logger.warning("Re-run of %s crashed: %s", flow.flow_id, e)
-                await controller.recover()
+        # Both follow-up checks replay the exact recorded steps (no agent model calls), like a tester
+        # repeating what they just did. A replay that couldn't perform the same steps proves nothing.
+        script = [s.action for s in result.steps]
 
-        if not verdict.passed and verdict.verdict != "ERROR" and compare_url:
-            console.print("  [yellow]Checking whether the base version has the same problem...[/yellow]")
+        async def replay(url: str, suffix: str):
             try:
-                base = await runner.run_flow(flow, base_url=compare_url, artifacts_dir=output_dir / f"{flow.flow_id}-base")
-                base_verdict = await judge.judge_flow(base)
-                # A base run that couldn't test (ERROR) proves nothing either way: leave it unknown.
-                if base_verdict.verdict != "ERROR":
-                    verdict.pre_existing = not base_verdict.passed
+                again = await runner.run_flow(flow, base_url=url, artifacts_dir=output_dir / f"{flow.flow_id}-{suffix}",
+                                              script=script)
+                if _diverged(result, again):
+                    return None
+                second = await judge.judge_flow(again)
+                return None if second.verdict == "ERROR" else not second.passed
             except Exception as e:
-                logger.warning("Base run of %s crashed: %s", flow.flow_id, e)
+                logger.warning("Replay of %s on %s crashed: %s", flow.flow_id, url, e)
                 await controller.recover()
+                return None
+
+        if not verdict.passed and verdict.verdict != "ERROR" and settings.rerun_failures and script:
+            console.print("  [yellow]Failure observed; replaying the same steps to confirm...[/yellow]")
+            verdict.reproduced = await replay(base_url, "rerun")
+            if verdict.reproduced is False:
+                verdict.confidence = min(verdict.confidence, 0.5)
+
+        if not verdict.passed and verdict.verdict != "ERROR" and compare_url and script:
+            console.print("  [yellow]Replaying on the base version to see if it was already broken...[/yellow]")
+            # Unknown (None) stays blocking: never excuse a failure without proof it predates the change.
+            verdict.pre_existing = await replay(compare_url, "base")
 
         spec_ts = None
         if verdict.passed:
@@ -107,3 +110,14 @@ async def execute_plan(
             invariants=flow.invariants,
         ))
     return items
+
+
+def _diverged(original: FlowRunResult, replay: FlowRunResult) -> bool:
+    """True when the replay couldn't do what the original run did (a click or fill that worked before
+    now fails), so its outcome says nothing about the bug. Failed assertions are the point: not divergence."""
+    if len(replay.steps) < len(original.steps):
+        return True
+    return any(
+        o.success and not r.success and r.action.action != ActionType.ASSERT
+        for o, r in zip(original.steps, replay.steps)
+    )

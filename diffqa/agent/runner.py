@@ -39,6 +39,8 @@ MAX_PAGE_TEXT_CHARS = 4000
 STEP_PAGE_TEXT_CHARS = 1500
 MAX_PROMPT_ELEMENTS = 80
 MAX_LLM_FAILURES = 3
+MAX_FAILED_ASSERTS = 2
+FULL_HISTORY_STEPS = 6  # older steps go into the prompt as one-liners to keep token use flat
 
 
 def flow_url(base_url: str, route: str) -> str:
@@ -105,8 +107,14 @@ class BrowserAgentRunner:
         flow: UserFlow,
         base_url: str,
         artifacts_dir: Optional[Path] = None,
+        script: Optional[List[AgentAction]] = None,
     ) -> FlowRunResult:
-        """Run an entire user flow to completion."""
+        """Run an entire user flow to completion.
+
+        With ``script``, replay those recorded actions instead of asking the model: confirming a
+        failure or checking the base version then costs one judge call, not a call per step.
+        """
+        script = [a.model_copy() for a in script] if script is not None else None
         artifacts_dir = artifacts_dir or self.settings.output_dir / flow.flow_id
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -141,7 +149,15 @@ class BrowserAgentRunner:
         # Pages a person could reach: where they started, where they've been, and what the app links to.
         known_paths = {_path(initial_url)}
 
+        failed_asserts = 0
+
         while step_num < self.settings.max_steps_per_flow:
+            if script is not None and not script:
+                break
+            if script is None and failed_asserts >= MAX_FAILED_ASSERTS:
+                # The bug is on record; more steps would only burn time and credits restating it.
+                logger.info(f"Flow '{flow.flow_id}' stopped after {failed_asserts} failed assertions.")
+                break
             step_num += 1
             step_start = time.time()
             url_before = self.controller.page.url
@@ -164,7 +180,10 @@ class BrowserAgentRunner:
                 saved_screenshot = None
 
             # 3. Build prompt for Next Action
-            history_text = "\n".join(self._describe_step(s) for s in steps) or "None (just landed on page)"
+            cut = len(steps) - FULL_HISTORY_STEPS
+            history_text = "\n".join(
+                self._describe_step(s, brief=i < cut) for i, s in enumerate(steps)
+            ) or "None (just landed on page)"
             if time.time() - start_time > self.settings.flow_timeout_seconds:
                 logger.warning(f"Flow '{flow.flow_id}' hit its {self.settings.flow_timeout_seconds}s budget.")
                 break
@@ -188,10 +207,13 @@ Choose the next action to advance this test."""
                 {"role": "user", "content": user_prompt},
             ]
 
-            # 4. Prompt LLM for Action
+            # 4. Prompt LLM for Action (or take the next recorded one)
             try:
-                action_data = await self.llm.complete_json(messages, model=self.settings.agent_model)
-                action = AgentAction(**action_data)
+                if script is not None:
+                    action = script.pop(0)
+                else:
+                    action_data = await self.llm.complete_json(messages, model=self.settings.agent_model)
+                    action = AgentAction(**action_data)
                 llm_failures = 0
             except Exception as e:
                 # One bad reply shouldn't end the flow; a persistently failing model should.
@@ -232,6 +254,8 @@ Choose the next action to advance this test."""
                 exec_success = False
                 error_msg = str(e).split("\n")[0][:300]
                 failed_actions.setdefault((action.action, action.selector, action.value), error_msg)
+                if action.action == ActionType.ASSERT:
+                    failed_asserts += 1
                 logger.warning(f"Action execution failed on step {step_num}: {error_msg}")
 
             # Keep the agent on the site under test (external links, OAuth popups in the main tab, ads).
@@ -301,9 +325,11 @@ Choose the next action to advance this test."""
         )
 
     @staticmethod
-    def _describe_step(s: ExecutionStep) -> str:
+    def _describe_step(s: ExecutionStep, brief: bool = False) -> str:
         line = (f"Step {s.step_number}: [{s.action.action.value}] target={s.action.target_id} value='{s.action.value}' "
                 f"(success={s.success}{', error=' + s.error_message[:150] if s.error_message else ''})")
+        if brief:
+            return line
         for d in s.dialogs:
             line += f"\n    Dialog appeared: {d[:200]}"
         for o in s.observations:

@@ -69,8 +69,8 @@ class Settings(BaseSettings):
     viewport_height: int = 800
     action_timeout_ms: int = 10_000
     navigation_timeout_ms: int = 30_000
-    max_steps_per_flow: int = 25
-    flow_timeout_seconds: int = 300
+    max_steps_per_flow: int = 15
+    flow_timeout_seconds: int = 180
     # Failed flows are re-run once so the report can say whether the bug reproduced.
     rerun_failures: bool = True
 
