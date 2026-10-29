@@ -261,6 +261,19 @@ False positives: 0/1 clean runs flagged
 
 The mock can only see hard failures. The other four scenarios are invariant bugs (wrong totals, negative quantities, a hidden button, a missing confirmation): catching them requires a real model, which receives the page's final visible text alongside the flow's invariants. Run `diffqa eval --provider meta` (or another provider) to measure that.
 
+Live result with Muse Spark Open on Fireworks (`accounts/fireworks/models/muse-spark-open`):
+
+| Scenario | Result |
+|---|---|
+| broken_promo_uncaught_error | Caught, reproduced on re-run |
+| negative_cart_qty | Caught ("decrement 1→0 leaves a ghost cart item"), reproduced |
+| silent_checkout_failure | Caught ("checkout clears cart but never confirms"), reproduced |
+| wrong_total_calculation | Caught ("subtotal uses price+qty instead of price×qty"), CRITICAL, reproduced |
+| hidden_checkout_css | Caught after the planner fix below, reproduced |
+| baseline_clean | No false positives after the fixes below |
+
+How we got there, honestly: the first full live run caught 4/5 and flagged the clean store. That flag was a real bug in the demo store (checkout never emptied the cart), which we fixed. The live runs also exposed three DiffQA faults, each now fixed and covered by a test: the planner treated the diff as the spec ("verify the button is hidden"), the agent navigated to made-up URLs, and a pre-existing quirk was blamed on the change. The hidden-checkout and clean-baseline rows come from targeted re-runs after those fixes, not from one single end-to-end run.
+
 ---
 
 ## 🧪 Auto-Generated Playwright Test Example
